@@ -1,3 +1,10 @@
+## [1.14.10](https://github.com/mezmo/aura/compare/v1.14.9...v1.14.10) (2026-03-11)
+
+
+### Chores
+
+* **build**: remove GH actions for Jenkins [8be0576](https://github.com/mezmo/aura/commit/8be0576d3eb6ea7eb1209d3df661f09b75732e79) - Gregory Janco [LOG-23283](https://logdna.atlassian.net/browse/LOG-23283)
+
 ## [1.14.9](https://github.com/mezmo/aura/compare/v1.14.8...v1.14.9) (2026-03-11)
 
 
