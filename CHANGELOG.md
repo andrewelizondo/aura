@@ -1,3 +1,11 @@
+## [1.14.13](https://github.com/mezmo/aura/compare/v1.14.12...v1.14.13) (2026-03-12)
+
+
+### Chores
+
+* **build**: allow feature branch name flexibility [8f37182](https://github.com/mezmo/aura/commit/8f37182db9e71e3e1dcb5ef248932f6a63e9f140) - Gregory Janco [LOG-23418](https://logdna.atlassian.net/browse/LOG-23418)
+* **context-window**: use TOML configured window not mapping [a283973](https://github.com/mezmo/aura/commit/a283973d6469a5468b6b3692a2f149dee7ed57f3) - Justin Gross [LOG-23394](https://logdna.atlassian.net/browse/LOG-23394)
+
 ## [1.14.12](https://github.com/mezmo/aura/compare/v1.14.11...v1.14.12) (2026-03-11)
 
 
