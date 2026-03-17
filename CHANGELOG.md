@@ -1,3 +1,10 @@
+## [1.15.2](https://github.com/mezmo/aura/compare/v1.15.1...v1.15.2) (2026-03-17)
+
+
+### Tests
+
+* **dep**: reference mock-mcp from docker [8623f01](https://github.com/mezmo/aura/commit/8623f01270c561c08eb33a5f2188d49a19b07ddf) - Gregory Janco [LOG-23406](https://logdna.atlassian.net/browse/LOG-23406)
+
 ## [1.15.1](https://github.com/mezmo/aura/compare/v1.15.0...v1.15.1) (2026-03-17)
 
 
