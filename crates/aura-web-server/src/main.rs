@@ -11,6 +11,7 @@ mod mcp_state;
 mod streaming;
 mod types;
 
+use mcp_handler::build_mcp_service;
 use mcp_state::McpTaskStore;
 use streaming::ToolResultMode;
 use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
@@ -175,6 +176,7 @@ async fn run() -> std::io::Result<()> {
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
+
     let stream_shutdown_token = CancellationToken::new();
     let active_requests = Arc::new(ActiveRequestTracker::new());
 
@@ -182,7 +184,7 @@ async fn run() -> std::io::Result<()> {
 
     // Create app state
     let app_state = web::Data::new(AppState {
-        configs: configs_arc,
+        configs: configs_arc.clone(),
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -201,12 +203,19 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
+    // Build MCP service — child token so MCP sessions cancel before full shutdown
+    let mcp_service = Arc::new(build_mcp_service(
+        Arc::clone(&configs_arc),
+        Arc::clone(&mcp_task_store),
+        shutdown_token.child_token(),
+    ));
+
     // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
-    let mcp_task_store_data = web::Data::new(mcp_task_store);
+    let mcp_service_data = web::Data::new(mcp_service);
     let server = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .app_data(mcp_task_store_data.clone())
+            .app_data(mcp_service_data.clone())
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
             .route("/health", web::get().to(handlers::health))
@@ -215,7 +224,9 @@ async fn run() -> std::io::Result<()> {
                 "/v1/chat/completions",
                 web::post().to(handlers::chat_completions),
             )
-            .route("/mcp", web::post().to(mcp_handler::mcp_endpoint))
+            .route("/mcp", web::post().to(mcp_handler::mcp_route))
+            .route("/mcp", web::get().to(mcp_handler::mcp_route))
+            .route("/mcp", web::delete().to(mcp_handler::mcp_route))
     })
     .bind((args.host.as_str(), args.port))?
     .disable_signals()
