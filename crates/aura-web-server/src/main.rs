@@ -6,9 +6,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod handlers;
+mod mcp_handler;
+mod mcp_state;
 mod streaming;
 mod types;
 
+use mcp_state::McpTaskStore;
 use streaming::ToolResultMode;
 use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
 
@@ -167,6 +170,9 @@ async fn run() -> std::io::Result<()> {
 
     let configs_arc = Arc::new(configs);
 
+    // Shared MCP task store — tracks agent tasks triggered via POST /mcp
+    let mcp_task_store = McpTaskStore::new();
+
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
     let stream_shutdown_token = CancellationToken::new();
@@ -196,9 +202,11 @@ async fn run() -> std::io::Result<()> {
     );
 
     // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
+    let mcp_task_store_data = web::Data::new(mcp_task_store);
     let server = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
+            .app_data(mcp_task_store_data.clone())
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
             .route("/health", web::get().to(handlers::health))
@@ -207,6 +215,7 @@ async fn run() -> std::io::Result<()> {
                 "/v1/chat/completions",
                 web::post().to(handlers::chat_completions),
             )
+            .route("/mcp", web::post().to(mcp_handler::mcp_endpoint))
     })
     .bind((args.host.as_str(), args.port))?
     .disable_signals()

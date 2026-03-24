@@ -1,0 +1,98 @@
+# Example: Aura as an MCP Server
+#
+# This configuration demonstrates the "Aura-as-MCP-Server" pattern from
+# LOG-23455 / LOG-23078.  Aura exposes a POST /mcp endpoint on the same web
+# server as the OpenAI-compatible API, allowing:
+#
+#   1. Another agent  — call Aura tools via its MCP client
+#   2. A service      — CI/CD, alerting, monitoring via webhook-like triggers
+#   3. A person       — via Claude Desktop, LibreChat MCP, or any MCP-aware tool
+#
+# Start the server:
+#
+#   cargo run -p aura-web-server -- --config examples/mcp/mcp-server.toml
+#
+# Then test with curl:
+#
+#   # 1. Initialize (MCP handshake)
+#   curl -s -X POST http://localhost:8080/mcp \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl-test","version":"0.1"}}}'
+#
+#   # 2. List available tools
+#   curl -s -X POST http://localhost:8080/mcp \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+#
+#   # 3. Trigger an agent (async — returns task_id immediately)
+#   curl -s -X POST http://localhost:8080/mcp \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"trigger_agent","arguments":{"agent":"incident-responder","prompt":"Check if there are any active P1 incidents and summarize their status."}}}'
+#
+#   # 4. Query the task status
+#   curl -s -X POST http://localhost:8080/mcp \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query_agent_status","arguments":{"task_id":"<task_id from step 3>"}}}'
+#
+#   # 5. Send additional context to a running task
+#   curl -s -X POST http://localhost:8080/mcp \
+#     -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_context_to_agent","arguments":{"task_id":"<task_id>","context":"New alert: CPU usage on web-01 spiked to 98% 30s ago."}}}'
+#
+# --- Multiple agents as MCP "workflows-as-tools" --------------------------------
+#
+# Each agent block below maps to a workflow with its own system prompt and
+# toolbelt.  MCP clients can trigger any of them by name via trigger_agent.
+# This implements Henry's "workflows as tools" suggestion from Slack.
+
+# ── Agent 1: General assistant (minimal) ────────────────────────────────────
+
+[llm]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-6"
+
+[agent]
+name = "Assistant"
+alias = "assistant"
+system_prompt = """
+You are a helpful assistant. Answer questions clearly and concisely.
+"""
+
+---
+
+# ── Agent 2: Incident responder (with MCP tools) ────────────────────────────
+#
+# Uncomment and adjust this second config block to add an incident-response
+# workflow.  Run with a multi-config glob:
+#
+#   cargo run -p aura-web-server -- --config 'examples/mcp/*.toml'
+#
+# [llm]
+# provider = "anthropic"
+# api_key_env = "ANTHROPIC_API_KEY"
+# model = "claude-sonnet-4-6"
+#
+# [agent]
+# name = "Incident Responder"
+# alias = "incident-responder"
+# system_prompt = """
+# You are an SRE incident-response agent. When triggered:
+# 1. Check current alert status via the tools available to you
+# 2. Correlate signals across services
+# 3. Provide a concise incident summary with recommended next steps
+# """
+# turn_depth = 8
+#
+# [mcp.servers.pagerduty]
+# transport = "http_streamable"
+# url = "https://mcp.pagerduty.com/mcp"
+# [mcp.servers.pagerduty.headers]
+# Authorization = "Token token=YOUR_PD_TOKEN"
+#
+# [mcp.servers.datadog]
+# transport = "http_streamable"
+# url = "https://mcp.datadoghq.com/mcp"
+# [mcp.servers.datadog.headers]
+# DD-API-KEY = "YOUR_DD_API_KEY"
+# DD-APPLICATION-KEY = "YOUR_DD_APP_KEY"
