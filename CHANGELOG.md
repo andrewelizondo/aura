@@ -1,3 +1,10 @@
+## [1.16.2](https://github.com/mezmo/aura/compare/v1.16.1...v1.16.2) (2026-03-25)
+
+
+### Documentation
+
+* Update Readme for quickstart link [91755ef](https://github.com/mezmo/aura/commit/91755efceb73315eb91b5bac6d5eb400c4ae2df3) - Terry Moore [LOG-23494](https://logdna.atlassian.net/browse/LOG-23494)
+
 ## [1.16.1](https://github.com/mezmo/aura/compare/v1.16.0...v1.16.1) (2026-03-25)
 
 
