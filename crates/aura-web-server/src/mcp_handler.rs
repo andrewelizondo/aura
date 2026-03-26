@@ -25,7 +25,6 @@
 //! |------|-------------|
 //! | `trigger_agent` | Kick off an Aura agent with a prompt (webhook-like) |
 //! | `query_agent_status` | Poll status / result of a running task |
-//! | `send_context_to_agent` | Push additional context to a running task |
 //!
 //! # Transport Note
 //!
@@ -57,6 +56,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::mcp_state::{AgentTask, McpTaskStore, TaskStatus};
+use crate::types::{ActiveRequestGuard, AppState};
 
 // ---------------------------------------------------------------------------
 // Tool parameter structs
@@ -81,16 +81,6 @@ struct TriggerAgentParams {
 struct QueryStatusParams {
     /// Task ID previously returned by `trigger_agent`.
     task_id: String,
-}
-
-/// Parameters for `send_context_to_agent`.
-#[derive(Debug, Deserialize, JsonSchema)]
-struct SendContextParams {
-    /// Task ID of the running agent.
-    task_id: String,
-    /// Additional context or data to feed to the agent (alert text, log
-    /// excerpt, metric snapshot, etc.).
-    context: String,
 }
 
 fn bool_true() -> bool {
@@ -162,13 +152,17 @@ impl AuraServer {
         };
 
         let task_id = format!("mcp-task-{}", Uuid::new_v4().simple());
-        self.task_store
+        if let Err(e) = self
+            .task_store
             .insert(AgentTask::new(
                 task_id.clone(),
                 args.agent.clone(),
                 args.prompt.clone(),
             ))
-            .await;
+            .await
+        {
+            return Err(McpError::internal_error(e, None));
+        }
 
         info!(
             task_id = %task_id,
@@ -181,8 +175,20 @@ impl AuraServer {
             let store = Arc::clone(&self.task_store);
             let id = task_id.clone();
             let prompt = args.prompt.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 run_agent_task(store, id, config, prompt).await;
+            });
+
+            // Watch for panics so the task doesn't stay "running" forever.
+            let panic_store = Arc::clone(&self.task_store);
+            let panic_id = task_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle.await {
+                    error!(task_id = %panic_id, "MCP agent task panicked: {e}");
+                    panic_store
+                        .fail(&panic_id, format!("Agent panicked: {e}"))
+                        .await;
+                }
             });
 
             Ok(CallToolResult::success(vec![Content::text(format!(
@@ -250,46 +256,6 @@ impl AuraServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    /// Push additional context or data to a running agent task.
-    #[tool(description = "Push additional context or data to a running agent task. \
-        Useful for feeding alerts, log excerpts, or metric snapshots to a long-running agent. \
-        Context is queued and incorporated into the agent's next reasoning step.")]
-    async fn send_context_to_agent(
-        &self,
-        Parameters(args): Parameters<SendContextParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let task = match self.task_store.get(&args.task_id).await {
-            Some(t) => t,
-            None => {
-                return Err(McpError::invalid_params(
-                    format!("Task '{}' not found.", args.task_id),
-                    None,
-                ));
-            }
-        };
-
-        if task.status != TaskStatus::Running {
-            return Err(McpError::invalid_params(
-                format!(
-                    "Task '{}' is not running (status: {}). \
-                     Context can only be sent to running tasks.",
-                    args.task_id, task.status
-                ),
-                None,
-            ));
-        }
-
-        self.task_store
-            .add_context(&args.task_id, args.context.clone())
-            .await;
-
-        info!(task_id = %args.task_id, "MCP send_context_to_agent: context queued");
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Context queued for task {}.",
-            args.task_id
-        ))]))
-    }
 }
 
 // Wire the tool router into the ServerHandler trait.
@@ -360,9 +326,13 @@ pub fn build_mcp_service(
 ///    actix `HttpResponse`, streaming the body for SSE connections.
 pub async fn mcp_route(
     svc: web::Data<Arc<AuraMcpService>>,
+    data: web::Data<AppState>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> HttpResponse {
+    // Track this request for graceful shutdown (auto-decrements on drop).
+    let _active_guard = ActiveRequestGuard::new(data.active_requests.clone());
+
     // --- 1. Build http::Request -----------------------------------------------
     // actix-web re-exports http::Method, http::Uri, http::HeaderMap from the
     // same `http` crate, so the types are directly compatible.

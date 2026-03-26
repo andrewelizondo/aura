@@ -1,20 +1,25 @@
 //! In-memory state for MCP agent tasks.
 //!
 //! Tracks agent tasks triggered via the MCP `trigger_agent` tool so that callers
-//! can query status and inject additional context via `query_agent_status` and
-//! `send_context_to_agent`.
+//! can query status via `query_agent_status`.
 //!
 //! # Design Notes
 //!
-//! Tasks are stored in a `RwLock<HashMap>` for simplicity in this prototype.
-//! In production this would be backed by a durable store and would support
-//! task expiry / cleanup.
+//! Tasks are stored in a `RwLock<HashMap>` with TTL-based eviction. Completed or
+//! failed tasks are automatically removed after [`TASK_TTL_SECS`] seconds, and
+//! the store is capped at [`MAX_TASKS`] entries to prevent unbounded growth.
 
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Maximum number of tasks retained in the store.
+const MAX_TASKS: usize = 10_000;
+
+/// Finished tasks are evicted after this many seconds (1 hour).
+const TASK_TTL_SECS: i64 = 3600;
 
 /// Lifecycle state of an MCP-triggered agent task.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -50,18 +55,13 @@ pub struct AgentTask {
     /// Current lifecycle status.
     pub status: TaskStatus,
     /// Unix timestamp (seconds) when the task was created.
-    pub created_at: u64,
+    pub created_at: i64,
     /// Unix timestamp (seconds) when the task completed/failed, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<u64>,
+    pub completed_at: Option<i64>,
     /// Final agent response text, available when status is `Complete`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// Additional context messages pushed by callers via `send_context_to_agent`.
-    /// In this prototype they are stored but not yet fed back into a live agent;
-    /// a production implementation would forward them to the running stream.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub context_messages: Vec<String>,
 }
 
 impl AgentTask {
@@ -71,15 +71,17 @@ impl AgentTask {
             agent,
             prompt,
             status: TaskStatus::Running,
-            created_at: Utc::now().timestamp() as u64,
+            created_at: Utc::now().timestamp(),
             completed_at: None,
             result: None,
-            context_messages: Vec::new(),
         }
     }
 }
 
 /// Shared, thread-safe store of MCP agent tasks.
+///
+/// Finished tasks are evicted after [`TASK_TTL_SECS`] on each insert, and the
+/// total number of entries is capped at [`MAX_TASKS`].
 #[derive(Default)]
 pub struct McpTaskStore {
     tasks: RwLock<HashMap<String, AgentTask>>,
@@ -93,9 +95,19 @@ impl McpTaskStore {
     }
 
     /// Insert a new task (status: Running).
-    pub async fn insert(&self, task: AgentTask) {
+    ///
+    /// Returns `Err` with a message if the store is at capacity even after
+    /// evicting expired entries.
+    pub async fn insert(&self, task: AgentTask) -> Result<(), String> {
         let mut guard = self.tasks.write().await;
+        Self::evict_expired(&mut guard);
+        if guard.len() >= MAX_TASKS {
+            return Err(format!(
+                "Task store at capacity ({MAX_TASKS}). Try again later."
+            ));
+        }
         guard.insert(task.id.clone(), task);
+        Ok(())
     }
 
     /// Retrieve a task by ID.
@@ -110,7 +122,7 @@ impl McpTaskStore {
         if let Some(task) = guard.get_mut(id) {
             task.status = TaskStatus::Complete;
             task.result = Some(result);
-            task.completed_at = Some(Utc::now().timestamp() as u64);
+            task.completed_at = Some(Utc::now().timestamp());
         }
     }
 
@@ -119,19 +131,97 @@ impl McpTaskStore {
         let mut guard = self.tasks.write().await;
         if let Some(task) = guard.get_mut(id) {
             task.status = TaskStatus::Failed(reason);
-            task.completed_at = Some(Utc::now().timestamp() as u64);
+            task.completed_at = Some(Utc::now().timestamp());
         }
     }
 
-    /// Append a context message to a task.
-    /// Returns `false` if the task does not exist.
-    pub async fn add_context(&self, id: &str, context: String) -> bool {
-        let mut guard = self.tasks.write().await;
-        if let Some(task) = guard.get_mut(id) {
-            task.context_messages.push(context);
-            true
-        } else {
-            false
+    /// Remove finished tasks whose `completed_at` is older than [`TASK_TTL_SECS`].
+    fn evict_expired(tasks: &mut HashMap<String, AgentTask>) {
+        let cutoff = Utc::now().timestamp() - TASK_TTL_SECS;
+        tasks.retain(|_, t| match t.status {
+            TaskStatus::Running => true,
+            _ => t.completed_at.is_none_or(|ts| ts > cutoff),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_insert_and_get() {
+        let store = McpTaskStore::new();
+        let task = AgentTask::new("t1".into(), "agent".into(), "hello".into());
+        store.insert(task).await.unwrap();
+
+        let t = store.get("t1").await.unwrap();
+        assert_eq!(t.id, "t1");
+        assert_eq!(t.status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_returns_none() {
+        let store = McpTaskStore::new();
+        assert!(store.get("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_complete() {
+        let store = McpTaskStore::new();
+        store
+            .insert(AgentTask::new("t1".into(), "a".into(), "p".into()))
+            .await
+            .unwrap();
+
+        store.complete("t1", "done".into()).await;
+        let t = store.get("t1").await.unwrap();
+        assert_eq!(t.status, TaskStatus::Complete);
+        assert_eq!(t.result.as_deref(), Some("done"));
+        assert!(t.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fail() {
+        let store = McpTaskStore::new();
+        store
+            .insert(AgentTask::new("t1".into(), "a".into(), "p".into()))
+            .await
+            .unwrap();
+
+        store.fail("t1", "boom".into()).await;
+        let t = store.get("t1").await.unwrap();
+        assert_eq!(t.status, TaskStatus::Failed("boom".into()));
+        assert!(t.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_eviction_removes_old_finished_tasks() {
+        let store = McpTaskStore::new();
+
+        // Manually insert a task with an old completed_at timestamp
+        {
+            let mut guard = store.tasks.write().await;
+            let mut old_task = AgentTask::new("old".into(), "a".into(), "p".into());
+            old_task.status = TaskStatus::Complete;
+            old_task.completed_at = Some(Utc::now().timestamp() - TASK_TTL_SECS - 1);
+            guard.insert("old".into(), old_task);
+
+            // Also insert a running task — should not be evicted
+            guard.insert(
+                "running".into(),
+                AgentTask::new("running".into(), "a".into(), "p".into()),
+            );
         }
+
+        // Trigger eviction via insert
+        store
+            .insert(AgentTask::new("new".into(), "a".into(), "p".into()))
+            .await
+            .unwrap();
+
+        assert!(store.get("old").await.is_none(), "expired task should be evicted");
+        assert!(store.get("running").await.is_some(), "running task should survive");
+        assert!(store.get("new").await.is_some(), "new task should exist");
     }
 }
