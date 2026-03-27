@@ -1,3 +1,11 @@
+## [1.16.3](https://github.com/mezmo/aura/compare/v1.16.2...v1.16.3) (2026-03-27)
+
+
+### Bug Fixes
+
+* **ci**: clean up stale containers before integration tests [6a1d67a](https://github.com/mezmo/aura/commit/6a1d67a9d0d2d2d598acee4ab0bd682e98c7beb2) - Mike Shearer [LOG-23413](https://logdna.atlassian.net/browse/LOG-23413)
+* **quickstart**: simplify provider config and fix UX issues [e10b2e3](https://github.com/mezmo/aura/commit/e10b2e370d2456878af24842474761a4483815e5) - Mike Shearer [LOG-23503](https://logdna.atlassian.net/browse/LOG-23503)
+
 ## [1.16.2](https://github.com/mezmo/aura/compare/v1.16.1...v1.16.2) (2026-03-25)
 
 
