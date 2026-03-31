@@ -22,28 +22,41 @@
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.2"
-# max_tokens = 8192
-# base_url = "https://api.openai.com/v1"  # custom endpoint
+# base_url = "https://api.openai.com/v1"  # custom endpoint (all providers)
 
 # Anthropic alternative:
 # provider = "anthropic"
 # api_key = "{{ env.ANTHROPIC_API_KEY }}"
 # model = "claude-sonnet-4-20250514"
+# base_url = "https://api.anthropic.com"  # custom endpoint
 
 # Ollama alternative (no API key needed):
 # provider = "ollama"
 # model = "qwen3:30b-a3b"
-# fallback_tool_parsing = true
+# base_url = "http://localhost:11434"     # default; change for remote Ollama
+# fallback_tool_parsing = true            # parse tool calls from text output
+#                                         # (for models that don't emit proper
+#                                         # tool_call structures)
+# num_ctx = 8192                          # context window size in tokens
+#                                         # (Ollama default: 2048)
+# num_predict = 512                       # max tokens to generate
+#                                         # (Ollama default: 128)
+# [llm.additional_params]                 # any extra Ollama model parameters
+# seed = 42                               # (see Ollama modelfile docs)
+# top_k = 40
 
 # AWS Bedrock alternative:
 # provider = "bedrock"
 # model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 # region = "{{ env.AWS_REGION }}"
+# profile = "my-aws-profile"             # AWS named profile (optional;
+#                                         # uses default credential chain if omitted)
 
 # Google Gemini alternative:
 # provider = "gemini"
 # api_key = "{{ env.GOOGLE_API_KEY }}"
 # model = "gemini-2.0-flash"
+# base_url = "https://generativelanguage.googleapis.com"  # custom endpoint
 
 # ── MCP Tool Servers ────────────────────────────────────────────────
 [mcp]
@@ -76,6 +89,19 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # [mcp.servers.auth_aware_server.headers_from_request]
 # # Maps: outgoing header name = incoming request header name
 # Authorization = "x-user-token"
+
+# ── Stdio transport ─────────────────────────────────────────────────
+# Spawn a local MCP server as a subprocess over stdin/stdout.
+# Useful for local tools, scripts, or servers that don't expose HTTP.
+#
+# [mcp.servers.local_tool]
+# transport = "stdio"
+# cmd = ["/usr/local/bin/my-mcp-server"]  # executable to run
+# args = ["--config", "/etc/mcp/config.json"]
+# description = "Local stdio MCP server"
+#
+# [mcp.servers.local_tool.env]
+# MY_ENV_VAR = "value"
 
 # ── Vector Stores (RAG) ────────────────────────────────────────────
 # Connects to an external Qdrant instance. The agent gets a
@@ -110,6 +136,16 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 #
 # embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
 
+# ── In-memory vector store (for testing / single-instance use) ──────
+# Documents are loaded at startup and lost on restart.
+#
+# [[vector_stores]]
+# name = "local_docs"
+# type = "in_memory"
+# context_prefix = "Local knowledge base"
+#
+# embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
+
 # ── Tools ───────────────────────────────────────────────────────────
 [tools]
 filesystem = false
@@ -131,12 +167,20 @@ Workflow:
 2. Correlate findings across sources.
 3. Return actionable findings and next steps.
 """
+# Additional context injected into the conversation (e.g., shared facts,
+# org-specific knowledge, runtime values). Each string is appended to
+# the agent's context window before the first user message.
+# context = [
+#   "Organization: Acme Corp",
+#   "Environment: production",
+# ]
 # created_at = 1677649963000   # optional: creation timestamp in ms since epoch
 #                              # Used in /v1/models response. Defaults to current time.
 # model_owner = "mezmo"        # override `owned_by` in /v1/models responses.
 #                              # Defaults to the LLM provider (e.g. "openai", "anthropic").
 # reasoning_effort = "medium"  # minimal, low, medium, high (provider support varies)
 # temperature = 0.7
+# max_tokens = 8192            # maximum tokens in the LLM response
 # Maximum tool-calling rounds per user turn. Higher values allow
 # deeper multi-step workflows but consume more tokens.
 turn_depth = 5
@@ -144,3 +188,104 @@ turn_depth = 5
 # in aura.session_info streaming events. Set this to your model's
 # actual context window.
 # context_window = 200000
+
+# ── Orchestration Mode ──────────────────────────────────────────────
+# Multi-agent orchestration with a coordinator and specialized workers.
+# The coordinator plans tasks and delegates to workers that each have
+# access to a scoped subset of tools and vector stores.
+#
+# NOTE: This feature is under active development (feature/orchestration-mode).
+#
+# [orchestration]
+# enabled = true
+#
+# # Maximum planning cycles the coordinator may attempt before returning
+# # a best-effort answer. Default: 3
+# max_planning_cycles = 3
+#
+# # Quality threshold (0.0–1.0) the coordinator uses when self-evaluating
+# # its response. Default: 0.8
+# quality_threshold = 0.8
+#
+# # Maximum retries when the coordinator produces an unparseable plan.
+# # Default: 3
+# max_plan_parse_retries = 3
+#
+# # Maximum number of execution phases per planning cycle. Default: 5
+# max_phases = 5
+#
+# # Allow the coordinator to answer directly without delegating to
+# # workers (for simple questions). Default: true
+# allow_direct_answers = true
+#
+# # Allow the coordinator to ask the user a clarifying question instead
+# # of guessing. Default: true
+# allow_clarification = true
+#
+# # How much tool information the coordinator sees during planning.
+# # Options: "none", "summary" (default), "full"
+# tools_in_planning = "summary"
+#
+# # Maximum number of tools exposed to any single worker. Default: 10
+# max_tools_per_worker = 10
+#
+# # Override the system prompt used for all workers (optional).
+# # If omitted, a default worker prompt is used.
+# # worker_system_prompt = "You are a specialist. Complete the task given to you."
+#
+# # Maximum consecutive duplicate tool calls before the worker aborts.
+# # Default: unset (no limit)
+# # max_consecutive_duplicate_tool_calls = 3
+#
+# # Vector stores accessible to the coordinator during planning.
+# coordinator_vector_stores = ["docs"]
+#
+# # ── Timeouts ──────────────────────────────────────────────────────
+# [orchestration.timeouts]
+# # Per-LLM-call timeout in seconds. 0 = disabled (default: 0)
+# per_call_timeout_secs = 30
+#
+# # ── Artifacts & Persistence ───────────────────────────────────────
+# [orchestration.artifacts]
+# # Base directory for session persistence (plans, results, history).
+# # Also accepted as: memory_path (alias for backward compatibility)
+# # Default: unset (no persistence)
+# memory_dir = "/var/lib/aura/sessions"
+#
+# # Worker result length threshold (characters) above which the result
+# # is written to a file artifact instead of inlined. Default: 4000
+# result_artifact_threshold = 4000
+#
+# # Target length (characters) for summarized worker results when they
+# # exceed result_artifact_threshold. Default: 2000
+# result_summary_length = 2000
+#
+# # Number of prior conversation turns to include in session history
+# # when restoring a session. Default: 3
+# session_history_turns = 3
+#
+# # ── Workers ───────────────────────────────────────────────────────
+# # Define specialized workers the coordinator can delegate tasks to.
+# # Each worker gets a scoped view of tools and vector stores.
+# # The table key becomes the worker's identifier.
+#
+# [orchestration.worker.sre]
+# description = "Handles infrastructure alerts and incident triage"
+# preamble = """
+# You are an SRE specialist. Investigate the given task using the
+# available tools and return a structured finding.
+# """
+# # Glob patterns filtering which MCP tools this worker can use.
+# # Default: all tools (no filter)
+# mcp_filter = ["pagerduty_*", "kubernetes_*"]
+# # Vector stores this worker can search.
+# vector_stores = ["runbooks"]
+# # Per-worker override for max tool-calling turns. Default: inherits
+# # the top-level agent.turn_depth.
+# turn_depth = 8
+#
+# [orchestration.worker.analyst]
+# description = "Queries logs and metrics for trend analysis"
+# preamble = "You are a data analyst. Query logs and metrics to answer the task."
+# mcp_filter = ["mezmo_*", "datadog_*"]
+# vector_stores = ["docs"]
