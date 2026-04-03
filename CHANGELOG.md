@@ -1,3 +1,10 @@
+## [1.16.4](https://github.com/mezmo/aura/compare/v1.16.3...v1.16.4) (2026-04-03)
+
+
+### Bug Fixes
+
+* **build**: change dry run parameters [f9a5b4d](https://github.com/mezmo/aura/commit/f9a5b4d0752c4f7fbf840dec549e0246479e24f8) - Gregory Janco [LOG-23558](https://logdna.atlassian.net/browse/LOG-23558)
+
 ## [1.16.3](https://github.com/mezmo/aura/compare/v1.16.2...v1.16.3) (2026-03-27)
 
 
