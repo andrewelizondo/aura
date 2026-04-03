@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod bash_tool;
 pub mod builder;
 pub mod config;
 pub mod error;
@@ -35,9 +36,10 @@ pub mod vector_dynamic;
 pub mod vector_store;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools};
+pub use bash_tool::{BashTool, BashToolConfig};
 pub use config::{
-    AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    AgentConfig, AgentSettings, BashToolSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
+    McpServerConfig, ReasoningEffort, ToolsConfig, VectorStoreConfig,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use provider_agent::{

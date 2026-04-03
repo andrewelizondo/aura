@@ -230,11 +230,60 @@ pub struct EmbeddingConfig {
     pub api_key: String,
 }
 
+/// Bash tool configuration for controlled shell execution
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BashToolSettings {
+    /// Whitelist of allowed command names. Empty = use built-in defaults.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    /// Working directory for command execution.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Maximum wall-clock time for a command in seconds (default: 30).
+    #[serde(default = "default_bash_timeout")]
+    pub timeout_secs: u64,
+    /// Maximum combined stdout+stderr size in bytes (default: 65536).
+    #[serde(default = "default_bash_max_output")]
+    pub max_output_bytes: usize,
+    /// Additional patterns to block beyond built-in safety checks.
+    #[serde(default)]
+    pub extra_blocked_patterns: Vec<String>,
+    /// Environment variables to set for commands.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+fn default_bash_timeout() -> u64 {
+    30
+}
+
+fn default_bash_max_output() -> usize {
+    65_536
+}
+
+impl Default for BashToolSettings {
+    fn default() -> Self {
+        Self {
+            allowed_commands: Vec::new(),
+            working_directory: None,
+            timeout_secs: 30,
+            max_output_bytes: 65_536,
+            extra_blocked_patterns: Vec::new(),
+            env: Default::default(),
+        }
+    }
+}
+
 /// Tools configuration
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ToolsConfig {
     #[serde(default)]
     pub filesystem: bool,
+    /// Enable bash tool with optional configuration.
+    /// Set to a table `[tools.bash]` to enable with custom settings,
+    /// or omit to disable.
+    #[serde(default)]
+    pub bash: Option<BashToolSettings>,
     #[serde(default)]
     pub custom_tools: Vec<String>,
 }

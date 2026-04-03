@@ -158,6 +158,16 @@ impl RigBuilder {
 
         let tools = self.config.tools.as_ref().map(|tools_config| ToolsConfig {
             filesystem: tools_config.filesystem,
+            bash: tools_config.bash.as_ref().map(|b| {
+                aura::config::BashToolSettings {
+                    allowed_commands: b.allowed_commands.clone(),
+                    working_directory: b.working_directory.clone(),
+                    timeout_secs: b.timeout_secs,
+                    max_output_bytes: b.max_output_bytes,
+                    extra_blocked_patterns: b.extra_blocked_patterns.clone(),
+                    env: b.env.clone(),
+                }
+            }),
             custom_tools: tools_config.custom_tools.clone(),
         });
 

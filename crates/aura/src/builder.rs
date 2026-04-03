@@ -452,6 +452,23 @@ impl Agent {
             builder_state = builder_state.add_tool(ListDirTool(fs_tool));
         }
 
+        // Add bash tool if configured
+        if let Some(tools_config) = &config.tools
+            && let Some(bash_settings) = &tools_config.bash
+        {
+            tracing::info!("Adding bash execution tool");
+            let bash_config = crate::bash_tool::BashToolConfig {
+                allowed_commands: bash_settings.allowed_commands.clone(),
+                working_directory: bash_settings.working_directory.clone(),
+                timeout_secs: bash_settings.timeout_secs,
+                max_output_bytes: bash_settings.max_output_bytes,
+                extra_blocked_patterns: bash_settings.extra_blocked_patterns.clone(),
+                env: bash_settings.env.clone(),
+            };
+            let bash_tool = crate::bash_tool::BashTool::new(bash_config);
+            builder_state = builder_state.add_tool(bash_tool);
+        }
+
         // Add vector store tools if configured
         if !config.vector_stores.is_empty() {
             tracing::info!("Adding {} vector store tool(s)", config.vector_stores.len());

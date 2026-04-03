@@ -115,6 +115,15 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 filesystem = false
 custom_tools = []
 
+# Bash tool — controlled shell execution for agents.
+# Uncomment to enable. Omit the entire [tools.bash] section to disable.
+# [tools.bash]
+# allowed_commands = []            # Empty = use safe defaults (ls, grep, cat, etc.)
+# working_directory = "/tmp/aura"  # Optional; defaults to process CWD
+# timeout_secs = 30                # Max wall-clock time per command
+# max_output_bytes = 65536         # Truncate output beyond this
+# extra_blocked_patterns = []      # Additional patterns to reject
+
 # ── Agent ───────────────────────────────────────────────────────────
 [agent]
 name = "Assistant"
