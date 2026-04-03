@@ -50,6 +50,15 @@ url = "http://math-mcp:8081/mcp"
 headers = {}
 description = "Math MCP server providing arithmetic, statistics, and trigonometry tools"
 
+# ── Tools ───────────────────────────────────────────────────────────
+# Built-in tools shared across the coordinator and workers.
+# Workers can access these via mcp_filter using their tool names:
+#   - "execute_bash" (bash tool)
+#   - "read_file", "list_directory" (filesystem tools)
+#
+# [tools.bash]
+# timeout_secs = 30
+
 # ── Orchestration ───────────────────────────────────────────────────
 
 [orchestration]

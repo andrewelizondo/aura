@@ -213,7 +213,7 @@ impl Agent {
                 // Add tools using the BuilderState helper
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, None).await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenAI(agent)
@@ -253,7 +253,7 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, None).await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Anthropic(agent)
@@ -307,7 +307,7 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, None).await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Bedrock(agent)
@@ -342,7 +342,7 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, None).await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Gemini(agent)
@@ -386,7 +386,7 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, None).await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Ollama(agent)
@@ -404,27 +404,51 @@ impl Agent {
         })
     }
 
-    /// Add all tools to a builder state (shared across all providers)
-    async fn add_all_tools<M>(
+    /// Add all tools to a builder state.
+    ///
+    /// When `tool_filter` is `None`, all configured tools are added (single-agent mode).
+    /// When `tool_filter` is `Some(names)`, only tools whose name appears in the set
+    /// are added. This supports orchestration mode where each worker receives a
+    /// filtered subset of tools via `mcp_filter`.
+    ///
+    /// Built-in tool names for filtering:
+    /// - `"read_file"`, `"list_directory"`, `"write_file"` (filesystem tools)
+    /// - `"execute_bash"` (bash tool)
+    /// - `"vector_search_<store_name>"` (vector store tools)
+    pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
         config: &AgentConfig,
         mcp_manager: &Option<Arc<McpManager>>,
+        tool_filter: Option<&[String]>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
     where
         M: rig::completion::CompletionModel + Send + Sync,
     {
+        let should_add = |name: &str| -> bool {
+            match &tool_filter {
+                None => true,
+                Some(names) => names.iter().any(|n| n == name),
+            }
+        };
+
         // Add HTTP streamable tools using dynamic adaptors
         if let Some(mcp_manager) = mcp_manager.as_deref() {
             for (server_name, client) in &mcp_manager.streamable_clients {
                 if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| should_add(&t.name))
+                        .collect();
+
                     tracing::info!(
-                        "Adding {} dynamic HTTP streamable tools from server: {}",
+                        "Adding {} dynamic HTTP streamable tools from server: {} (filtered from {})",
+                        filtered_tools.len(),
+                        server_name,
                         server_tools.len(),
-                        server_name
                     );
 
                     let client_arc = Arc::new(client.clone());
-                    for mcp_tool in server_tools {
+                    for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
 
                         let tool_adaptor = crate::mcp_dynamic::HttpMcpToolAdaptor::new(
@@ -443,18 +467,25 @@ impl Agent {
         if let Some(tools_config) = &config.tools
             && tools_config.filesystem
         {
-            tracing::info!("Adding filesystem tools");
-            let fs_tool = FilesystemTool::new()
-                .with_write_access(false)
-                .with_max_file_size(1_048_576);
+            if should_add("read_file") || should_add("list_directory") {
+                tracing::info!("Adding filesystem tools");
+                let fs_tool = FilesystemTool::new()
+                    .with_write_access(false)
+                    .with_max_file_size(1_048_576);
 
-            builder_state = builder_state.add_tool(ReadFileTool(fs_tool.clone()));
-            builder_state = builder_state.add_tool(ListDirTool(fs_tool));
+                if should_add("read_file") {
+                    builder_state = builder_state.add_tool(ReadFileTool(fs_tool.clone()));
+                }
+                if should_add("list_directory") {
+                    builder_state = builder_state.add_tool(ListDirTool(fs_tool));
+                }
+            }
         }
 
         // Add bash tool if configured
         if let Some(tools_config) = &config.tools
             && let Some(bash_settings) = &tools_config.bash
+            && should_add("execute_bash")
         {
             tracing::info!("Adding bash execution tool");
             let bash_config = crate::bash_tool::BashToolConfig {
@@ -474,6 +505,15 @@ impl Agent {
             tracing::info!("Adding {} vector store tool(s)", config.vector_stores.len());
 
             for vector_store_config in &config.vector_stores {
+                let tool_name = format!("vector_search_{}", vector_store_config.name);
+                if !should_add(&tool_name) {
+                    tracing::info!(
+                        "  Skipping vector store '{}' (filtered out)",
+                        vector_store_config.name
+                    );
+                    continue;
+                }
+
                 tracing::info!("  Configuring vector store: {}", vector_store_config.name);
 
                 let vector_store_manager =
@@ -485,8 +525,8 @@ impl Agent {
                 );
 
                 tracing::info!(
-                    "  Created dynamic tool 'vector_search_{}'",
-                    vector_store_config.name
+                    "  Created dynamic tool '{}'",
+                    tool_name
                 );
 
                 builder_state = builder_state.add_tool(vector_search_tool);
@@ -517,6 +557,10 @@ impl Agent {
             > = HashMap::new();
 
             for (tool, client) in &mcp_manager.tool_definitions {
+                if !should_add(&tool.name) {
+                    tracing::info!("  Skipping STDIO tool '{}' (filtered out)", tool.name);
+                    continue;
+                }
                 let client_key = format!("{client:?}");
                 tools_by_client
                     .entry(client_key)
