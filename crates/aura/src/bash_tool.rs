@@ -23,12 +23,25 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default maximum output size in bytes (64 KB).
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 65_536;
 
-/// Default allowed commands — safe, read-only utilities.
+/// Default allowed commands — text processing, pipelines, and system utilities.
+///
+/// File I/O commands (`cat`, `head`, `tail`, `ls`, `find`) are intentionally
+/// excluded to avoid overlap with Aura's dedicated `read_file` and
+/// `list_directory` filesystem tools. Users can add them back via
+/// `allowed_commands` in TOML config if needed.
 const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "grep", "find", "wc", "sort", "uniq", "echo", "date", "pwd",
-    "env", "whoami", "uname", "df", "du", "file", "stat", "basename", "dirname", "realpath",
-    "which", "curl", "jq", "sed", "awk", "cut", "tr", "tee", "xargs", "diff", "sha256sum",
-    "md5sum", "base64", "tar", "gzip", "gunzip", "zip", "unzip",
+    // Text processing & pipelines
+    "grep", "sed", "awk", "cut", "tr", "sort", "uniq", "wc", "diff", "xargs", "tee",
+    // HTTP & JSON
+    "curl", "jq",
+    // Archives & compression
+    "tar", "gzip", "gunzip", "zip", "unzip",
+    // Checksums & encoding
+    "sha256sum", "md5sum", "base64",
+    // System info
+    "echo", "date", "pwd", "env", "whoami", "uname", "df", "du",
+    // File metadata (no content reading)
+    "file", "stat", "basename", "dirname", "realpath", "which",
 ];
 
 /// Patterns that should never appear in commands, regardless of allowlist.
@@ -383,17 +396,28 @@ mod tests {
     #[test]
     fn allows_default_commands() {
         let config = default_config();
-        assert!(config.validate_command("ls -la").is_ok());
         assert!(config.validate_command("grep -r foo .").is_ok());
-        assert!(config.validate_command("cat /tmp/test.txt").is_ok());
         assert!(config.validate_command("echo hello world").is_ok());
+        assert!(config.validate_command("curl -s http://example.com | jq .").is_ok());
+        assert!(config.validate_command("sha256sum file.txt").is_ok());
+    }
+
+    #[test]
+    fn rejects_filesystem_overlap_commands() {
+        let config = default_config();
+        // These are handled by the dedicated filesystem tools
+        assert!(config.validate_command("cat /tmp/test.txt").is_err());
+        assert!(config.validate_command("ls -la").is_err());
+        assert!(config.validate_command("head -n 10 file.txt").is_err());
+        assert!(config.validate_command("tail -f log.txt").is_err());
+        assert!(config.validate_command("find . -name '*.rs'").is_err());
     }
 
     #[test]
     fn allows_pipelines() {
         let config = default_config();
-        assert!(config.validate_command("ls -la | grep foo | wc -l").is_ok());
-        assert!(config.validate_command("cat file.txt | sort | uniq").is_ok());
+        assert!(config.validate_command("echo hello | grep foo | wc -l").is_ok());
+        assert!(config.validate_command("echo lines | sort | uniq").is_ok());
     }
 
     #[test]
@@ -460,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stderr() {
         let tool = BashTool::new(default_config());
-        let result = tool.execute("ls /nonexistent_path_12345").await.unwrap();
+        let result = tool.execute("stat /nonexistent_path_12345").await.unwrap();
         assert_ne!(result.exit_code, 0);
         assert!(!result.stderr.is_empty());
     }
