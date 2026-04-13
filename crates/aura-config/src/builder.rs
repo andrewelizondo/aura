@@ -109,6 +109,8 @@ impl RigBuilder {
                     model: store.embedding_model.model.clone(),
                     api_key: store.embedding_model.api_key.clone(),
                     base_url: None,
+                    region: store.embedding_model.region.clone(),
+                    profile: store.embedding_model.profile.clone(),
                 },
                 connection_string: store.url.clone(),
                 url: store.url.clone(),

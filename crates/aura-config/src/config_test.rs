@@ -907,6 +907,133 @@ system_prompt = "You are helpful."
     }
 
     #[test]
+    fn test_bedrock_embedding_config_parsing() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "qdrant"
+url = "http://localhost:6334"
+collection_name = "documents"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+region = "us-west-2"
+profile = "my-profile"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        let vector_store = &config.vector_stores[0];
+        assert_eq!(vector_store.embedding_model.provider, "bedrock");
+        assert_eq!(
+            vector_store.embedding_model.model,
+            "amazon.titan-embed-text-v2:0"
+        );
+        assert_eq!(
+            vector_store.embedding_model.region,
+            Some("us-west-2".to_string())
+        );
+        assert_eq!(
+            vector_store.embedding_model.profile,
+            Some("my-profile".to_string())
+        );
+        // api_key defaults to empty for bedrock
+        assert_eq!(vector_store.embedding_model.api_key, "");
+    }
+
+    #[test]
+    fn test_bedrock_embedding_without_profile() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+region = "us-east-1"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        let vector_store = &config.vector_stores[0];
+        assert_eq!(vector_store.embedding_model.provider, "bedrock");
+        assert_eq!(vector_store.embedding_model.region, Some("us-east-1".to_string()));
+        assert_eq!(vector_store.embedding_model.profile, None);
+    }
+
+    #[test]
+    fn test_bedrock_embedding_missing_region_fails_validation() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("region"),
+            "Error should mention missing region: {err}"
+        );
+    }
+
+    #[test]
+    fn test_openai_embedding_still_requires_api_key() {
+        // Ensure existing OpenAI validation still works after Bedrock changes
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4"
+
+[[vector_stores]]
+name = "default"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-3-small"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err(), "OpenAI embedding without api_key should fail validation");
+    }
+
+    #[test]
     fn test_context_window_deserializes_from_toml() {
         let config_str = r#"
 [llm]

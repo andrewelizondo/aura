@@ -208,6 +208,10 @@ pub struct EmbeddingModelConfig {
     pub model: String,
     pub api_key: String,
     pub base_url: Option<String>,
+    /// AWS region (required for Bedrock embeddings)
+    pub region: Option<String>,
+    /// AWS profile name (optional, for Bedrock embeddings)
+    pub profile: Option<String>,
 }
 
 /// MCP (Model Context Protocol) configuration
