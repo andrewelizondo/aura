@@ -225,9 +225,16 @@ impl Default for VectorStoreConfig {
 /// Embedding model configuration
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct EmbeddingConfig {
-    pub provider: String, // "openai"
-    pub model: String,    // "text-embedding-3-small"
+    pub provider: String, // "openai" or "bedrock"
+    pub model: String,    // "text-embedding-3-small" or "amazon.titan-embed-text-v2:0"
+    #[serde(default)]
     pub api_key: String,
+    /// AWS region (required for Bedrock embeddings)
+    #[serde(default)]
+    pub region: Option<String>,
+    /// AWS profile name (optional, for Bedrock embeddings)
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Tools configuration
@@ -331,11 +338,29 @@ impl Config {
 
         // Validate each vector store
         for store in &self.vector_stores {
-            if store.embedding_model.api_key.is_empty() {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Embedding model API key is required for vector store '{}'",
-                    store.name
-                )));
+            match store.embedding_model.provider.as_str() {
+                "bedrock" => {
+                    if store.embedding_model.region.is_none()
+                        || store
+                            .embedding_model
+                            .region
+                            .as_ref()
+                            .is_some_and(|r| r.is_empty())
+                    {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Embedding model region is required for Bedrock provider in vector store '{}'",
+                            store.name
+                        )));
+                    }
+                }
+                _ => {
+                    if store.embedding_model.api_key.is_empty() {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Embedding model API key is required for vector store '{}'",
+                            store.name
+                        )));
+                    }
+                }
             }
         }
 

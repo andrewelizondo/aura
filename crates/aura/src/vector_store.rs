@@ -9,10 +9,17 @@ use rig::{
         VectorStoreIndex, in_memory_store::InMemoryVectorStore, request::VectorSearchRequest,
     },
 };
+use rig_bedrock::embedding::EmbeddingModel as BedrockEmbeddingModel;
 use rig_qdrant::QdrantVectorStore;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Qdrant store variant parameterized by embedding model type
+enum QdrantStoreKind {
+    OpenAI(QdrantVectorStore<OpenAIEmbeddingModel>),
+    Bedrock(QdrantVectorStore<BedrockEmbeddingModel>),
+}
 
 /// Vector store manager for handling document retrieval via vector search
 pub struct VectorStoreManager {
@@ -21,8 +28,9 @@ pub struct VectorStoreManager {
     pub qdrant_url: Option<String>,
     pub collection_name: Option<String>,
     pub in_memory_store: Option<Arc<InMemoryVectorStore<String>>>,
-    pub qdrant_store: Option<Arc<QdrantVectorStore<OpenAIEmbeddingModel>>>,
-    pub embedding_model: OpenAIEmbeddingModel,
+    qdrant_store: Option<Arc<QdrantStoreKind>>,
+    embedding_provider: String,
+    embedding_model_name: String,
     pub context_prefix: Option<String>,
 }
 
@@ -40,6 +48,58 @@ impl VectorStoreManager {
         }
     }
 
+    /// Create an embedding model from config, returning the Qdrant store kind or just
+    /// validating the provider for in-memory stores.
+    fn create_openai_embedding_model(
+        config: &VectorStoreConfig,
+    ) -> Result<OpenAIEmbeddingModel, BuilderError> {
+        let client = Client::new(&config.embedding_model.api_key).map_err(|e| {
+            BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
+        })?;
+        Ok(client.embedding_model(&config.embedding_model.model))
+    }
+
+    async fn create_bedrock_embedding_model(
+        config: &VectorStoreConfig,
+    ) -> Result<BedrockEmbeddingModel, BuilderError> {
+        use aws_config::{BehaviorVersion, Region};
+
+        let region = config
+            .embedding_model
+            .region
+            .as_ref()
+            .ok_or_else(|| {
+                BuilderError::VectorStoreError(
+                    "Region is required for Bedrock embedding provider".to_string(),
+                )
+            })?
+            .clone();
+
+        let sdk_config = if let Some(profile_name) = &config.embedding_model.profile {
+            info!(
+                "Loading AWS config with profile '{}' for Bedrock embeddings",
+                profile_name
+            );
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region))
+                .profile_name(profile_name)
+                .load()
+                .await
+        } else {
+            info!("Loading AWS config from environment for Bedrock embeddings");
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region))
+                .load()
+                .await
+        };
+
+        let aws_client = aws_sdk_bedrockruntime::Client::new(&sdk_config);
+        let bedrock_client = rig_bedrock::client::Client::from(aws_client);
+        info!("Bedrock embedding client initialized successfully");
+
+        Ok(bedrock_client.embedding_model(&config.embedding_model.model))
+    }
+
     /// Create an in-memory vector store
     async fn create_in_memory_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
         info!(
@@ -47,18 +107,22 @@ impl VectorStoreManager {
             config.embedding_model.model
         );
 
-        // Create OpenAI embedding model
-        let embedding_model = if config.embedding_model.provider == "openai" {
-            let client = Client::new(&config.embedding_model.api_key).map_err(|e| {
-                BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
-            })?;
-            client.embedding_model(&config.embedding_model.model)
-        } else {
-            return Err(BuilderError::VectorStoreError(format!(
-                "Unsupported embedding provider: {}. Only 'openai' is supported for now.",
-                config.embedding_model.provider
-            )));
-        };
+        // Validate the embedding provider is supported
+        match config.embedding_model.provider.as_str() {
+            "openai" => {
+                // Validate OpenAI client can be created
+                Self::create_openai_embedding_model(config)?;
+            }
+            "bedrock" => {
+                // Validate Bedrock client can be created
+                Self::create_bedrock_embedding_model(config).await?;
+            }
+            provider => {
+                return Err(BuilderError::VectorStoreError(format!(
+                    "Unsupported embedding provider: {provider}. Supported: 'openai', 'bedrock'.",
+                )));
+            }
+        }
 
         // Create an empty in-memory vector store for now
         let store = InMemoryVectorStore::from_documents(std::iter::empty::<(
@@ -75,7 +139,8 @@ impl VectorStoreManager {
             collection_name: None,
             qdrant_store: None,
             in_memory_store: Some(Arc::new(store)),
-            embedding_model,
+            embedding_provider: config.embedding_model.provider.clone(),
+            embedding_model_name: config.embedding_model.model.clone(),
             context_prefix: config.context_prefix.clone(),
         })
     }
@@ -108,19 +173,6 @@ impl VectorStoreManager {
             }
         };
 
-        // Create OpenAI embedding model
-        let embedding_model = if config.embedding_model.provider == "openai" {
-            let client = Client::new(&config.embedding_model.api_key).map_err(|e| {
-                BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
-            })?;
-            client.embedding_model(&config.embedding_model.model)
-        } else {
-            return Err(BuilderError::VectorStoreError(format!(
-                "Unsupported embedding provider: {}. Only 'openai' is supported for now.",
-                config.embedding_model.provider
-            )));
-        };
-
         // Create default query parameters for the collection
         let query_params = QueryPoints {
             collection_name: collection_name.clone(),
@@ -133,9 +185,26 @@ impl VectorStoreManager {
             ..Default::default()
         };
 
-        // Create the Qdrant vector store using rig-qdrant
-        let qdrant_store =
-            QdrantVectorStore::new(qdrant_client, embedding_model.clone(), query_params);
+        // Create embedding model and Qdrant store based on provider
+        let qdrant_store = match config.embedding_model.provider.as_str() {
+            "openai" => {
+                let embedding_model = Self::create_openai_embedding_model(config)?;
+                let store =
+                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                QdrantStoreKind::OpenAI(store)
+            }
+            "bedrock" => {
+                let embedding_model = Self::create_bedrock_embedding_model(config).await?;
+                let store =
+                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                QdrantStoreKind::Bedrock(store)
+            }
+            provider => {
+                return Err(BuilderError::VectorStoreError(format!(
+                    "Unsupported embedding provider: {provider}. Supported: 'openai', 'bedrock'.",
+                )));
+            }
+        };
 
         info!("Qdrant vector store initialized successfully");
 
@@ -146,7 +215,8 @@ impl VectorStoreManager {
             collection_name: Some(collection_name.clone()),
             qdrant_store: Some(Arc::new(qdrant_store)),
             in_memory_store: None,
-            embedding_model,
+            embedding_provider: config.embedding_model.provider.clone(),
+            embedding_model_name: config.embedding_model.model.clone(),
             context_prefix: config.context_prefix.clone(),
         })
     }
@@ -189,12 +259,17 @@ impl VectorStoreManager {
 
                     // Perform vector search using the VectorStoreIndex trait
                     debug!("Performing vector search in Qdrant for: '{}'", query);
-                    let search_results = qdrant_store
-                        .top_n::<serde_json::Value>(search_request)
-                        .await
-                        .map_err(|e| {
-                            BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
-                        })?;
+                    let search_results = match qdrant_store.as_ref() {
+                        QdrantStoreKind::OpenAI(store) => {
+                            store.top_n::<serde_json::Value>(search_request).await
+                        }
+                        QdrantStoreKind::Bedrock(store) => {
+                            store.top_n::<serde_json::Value>(search_request).await
+                        }
+                    }
+                    .map_err(|e| {
+                        BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
+                    })?;
 
                     // Convert results to our SearchResult format
                     let results: Vec<SearchResult> = search_results
@@ -230,10 +305,10 @@ impl VectorStoreManager {
     pub fn get_stats(&self) -> VectorStoreStats {
         VectorStoreStats {
             store_type: self.store_type.clone(),
-            embedding_provider: "openai".to_string(), // Only OpenAI supported for now
-            embedding_model: "text-embedding-3-small".to_string(), // From config
-            document_count: 0,                        // TODO: Get actual count from store
-            index_size: 0,                            // TODO: Get actual size from store
+            embedding_provider: self.embedding_provider.clone(),
+            embedding_model: self.embedding_model_name.clone(),
+            document_count: 0, // TODO: Get actual count from store
+            index_size: 0,     // TODO: Get actual size from store
         }
     }
 
@@ -269,13 +344,17 @@ impl VectorStoreManager {
                         ))
                     })?;
 
-                let mut candidates =
-                    qdrant_store
-                        .top_n::<Value>(search_request)
-                        .await
-                        .map_err(|e| {
-                            BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
-                        })?;
+                let mut candidates = match qdrant_store.as_ref() {
+                    QdrantStoreKind::OpenAI(store) => {
+                        store.top_n::<Value>(search_request).await
+                    }
+                    QdrantStoreKind::Bedrock(store) => {
+                        store.top_n::<Value>(search_request).await
+                    }
+                }
+                .map_err(|e| {
+                    BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
+                })?;
 
                 // Client-side filter by payload equality
                 candidates.retain(|(_score, _id, payload)| {
