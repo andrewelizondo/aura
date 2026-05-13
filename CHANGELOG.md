@@ -1,5 +1,20 @@
 ## Changelog
 
+## [1.19.8](https://github.com/mezmo/aura/compare/v1.19.7...v1.19.8) (2026-05-13)
+
+
+### Bug Fixes
+
+* **ci**: wrap release step with appropiate credentials [e8733e8](https://github.com/mezmo/aura/commit/e8733e8c71565c668a3f98f7905a4568cd0641e1) - Eric Satterwhite
+
+### Chores
+
+* **ci**: migrate to oss worker pool [5f24d1f](https://github.com/mezmo/aura/commit/5f24d1f28f24d502a61ed57795901fc259c0e887) - Eric Satterwhite
+
+### Service
+
+* **setup**: add .cargo to gitignore [a9a3a6d](https://github.com/mezmo/aura/commit/a9a3a6d1476360009a35a92c38f86fcc68d0109c) - Eric Satterwhite* **setup**: make a correction to the build tag variable scope [d74d26a](https://github.com/mezmo/aura/commit/d74d26a4fae6bb6f5f26a69699b36f98cf1245fc) - Eric Satterwhite* **setup**: remove erroneously commited .cargo directory [0a04f60](https://github.com/mezmo/aura/commit/0a04f60f6a5a23fa15c816f4112ba140909f51ac) - Eric Satterwhite
+
 ## [1.19.7](https://github.com/mezmo/aura/compare/v1.19.6...v1.19.7) (2026-05-11)
 
 
