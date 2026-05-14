@@ -18,19 +18,39 @@
 //! ## Span hierarchy (streaming)
 //!
 //! `agent.stream` is created as a **root span** (`parent: None`) so that
-//! Phoenix sees it as the trace root.  All LLM I/O attributes (`input.value`,
-//! `output.value`, token counts, `user.id`, `session.id`, `metadata`) live on
-//! this span.
+//! Phoenix sees it as the trace root.  I/O attributes (`input.value`,
+//! `output.value`, `user.id`, `session.id`, `metadata`) always live on this
+//! span. Token counts live here in **single-agent mode only**; in
+//! **orchestration mode** they live on the per-phase child spans
+//! (`orchestration.planning`, `orchestration.worker`,
+//! `orchestration.synthesis`, `orchestration.evaluation`) so Phoenix's
+//! rollup shows the accurate aggregate without double-counting the parent.
+//!
+//! ### Single-agent mode
 //!
 //! ```text
 //! agent.stream (AGENT, ROOT)        <- Phoenix root span, lives for full stream duration
 //!   ├── user.id, session.id, metadata, input.value, output.value, tokens
 //!   └── agent.turn (LLM)           <- from Rig fork (reuses agent.stream as parent)
-//!       ├── chat_streaming (LLM)    <- from Rig
 //!       ├── execute_tool (TOOL)     <- from Rig (no error status — see below)
 //!       │   └── mcp.tool_call (TOOL) <- from Aura, canonical tool span with error status
-//!       └── chat_streaming (LLM)    <- from Rig
+//!       └── execute_tool (TOOL)
+//!           └── mcp.tool_call (TOOL)
+//! ```
 //!
+//! ### Orchestration mode
+//!
+//! ```text
+//! agent.stream (AGENT, ROOT)
+//!   └── orchestration (CHAIN)                   <- full orchestration lifecycle
+//!         ├── orchestration.planning (CHAIN)     <- coordinator routing/planning
+//!         │   └── agent.turn (LLM) → ...
+//!         └── orchestration.iteration (CHAIN)    <- per plan-execute-continue cycle
+//!             └── orchestration.worker (AGENT)   <- per worker task
+//!                 └── agent.turn (LLM) → execute_tool → mcp.tool_call
+//! ```
+//!
+//! ```text
 //! chat_completions (separate trace)  <- HTTP infrastructure
 //!   └── streaming_completion         <- HTTP infrastructure
 //! ```
@@ -39,6 +59,10 @@
 //! so that `Span::current()` is active when rig's `send()` runs. Rig reuses
 //! the caller's span instead of creating its own `invoke_agent` span,
 //! keeping `agent.turn` as a direct child of `agent.stream`.
+//!
+//! For orchestration, the spawned task in `Orchestrator::stream()` is
+//! instrumented with the `agent.stream` span so that all orchestration
+//! child spans nest correctly under the trace root.
 //!
 //! Tool errors are only recorded on the `mcp.tool_call` child span (by
 //! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
@@ -131,12 +155,10 @@ pub fn truncate_for_otel(s: &str) -> String {
 
 /// Read content-recording env vars. Called once at the top of `init_logging`.
 fn init_content_config() {
-    if let Ok(val) = std::env::var("OTEL_RECORD_CONTENT") {
-        RECORD_CONTENT.store(
-            matches!(val.as_str(), "true" | "1" | "yes"),
-            Ordering::Relaxed,
-        );
-    }
+    RECORD_CONTENT.store(
+        crate::env_flags::bool_env("OTEL_RECORD_CONTENT", false),
+        Ordering::Relaxed,
+    );
     if let Ok(val) = std::env::var("OTEL_CONTENT_MAX_LENGTH")
         && let Ok(n) = val.parse::<usize>()
     {
@@ -276,6 +298,10 @@ fn otel_filter(binary_name: &str) -> EnvFilter {
 pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
     // Read content-recording config once
     init_content_config();
+
+    // Read attribute value length limit from env
+    #[cfg(feature = "otel")]
+    crate::openinference_exporter::init_attribute_value_length_limit();
 
     // Initialise OTel provider once; each branch builds its own typed layer from it
     #[cfg(feature = "otel")]
@@ -478,20 +504,30 @@ pub fn set_output_attributes(span: &tracing::Span, _text: &str) {
 /// task is polled, which may not happen reliably between requests.  Call this
 /// at the end of each request to guarantee spans are exported promptly.
 ///
+/// Uses `spawn_blocking` so the tokio runtime stays alive while
+/// `TracerProvider::force_flush()` blocks waiting for the `BatchSpanProcessor`
+/// background task. Calling `force_flush()` directly from a tokio worker
+/// thread deadlocks the batch processor (which itself runs on the runtime),
+/// permanently stalling subsequent exports.
+///
 /// No-op when OTel was not initialised or the `otel` feature is disabled.
 #[cfg(feature = "otel")]
-pub fn flush_tracer() {
+pub async fn flush_tracer() {
     if let Some(provider) = TRACER_PROVIDER.get() {
-        for result in provider.force_flush() {
-            if let Err(e) = result {
-                tracing::warn!("OpenTelemetry force_flush error: {e}");
+        let provider = provider.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for result in provider.force_flush() {
+                if let Err(e) = result {
+                    eprintln!("OpenTelemetry force_flush error: {e}");
+                }
             }
-        }
+        })
+        .await;
     }
 }
 
 #[cfg(not(feature = "otel"))]
-pub fn flush_tracer() {}
+pub async fn flush_tracer() {}
 
 /// Flush and shut down the OpenTelemetry tracer provider.
 ///

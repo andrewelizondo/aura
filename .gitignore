@@ -72,6 +72,12 @@ compose/env/.env*
 # Claude Code (keep local only)
 .claude/
 
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
 # Build artifacts and caches
 .cache/
 .build/
@@ -97,3 +103,10 @@ TODO.md
 
 # Test config files
 config-*-test.toml
+
+# Accidentally-committed testing cluster config (belongs on test cluster only)
+configs/example-cluster-orchestrator.toml
+
+# OpenCode agent state
+.opencode/
+

@@ -9,8 +9,9 @@ repository.workspace = true
 [dependencies]
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
-actix-web = "4.4"
-actix-web-lab = "0.22"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.6", features = ["trace"] }
+bytes = "1"
 async-stream = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
@@ -51,6 +52,15 @@ integration-progress = []                 # mcp_progress_test, progress_disconne
 
 # Optional - requires Qdrant (separate epic)
 integration-vector = []         # vector_label_filter_tests
+
+# Orchestration tests (separate from integration - needs different server config)
+integration-orchestration = []  # orchestration_events_test
+
+# SRE orchestration tests (separate - needs k8s-sre-mcp server config)
+integration-orchestration-sre = []  # sre_orchestration_test
+
+# Scratchpad integration tests (separate - needs scratchpad-test-mcp server config)
+integration-scratchpad = []  # scratchpad_test
 
 [dev-dependencies]
 tokio-test = "0.4"

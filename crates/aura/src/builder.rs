@@ -2,10 +2,13 @@ use crate::{
     config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
+    passthrough_tool::PassthroughTool,
     provider_agent::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
+    scratchpad,
+    tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
@@ -13,51 +16,70 @@ use crate::{
 use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Usage;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Default maximum depth for multi-turn conversations
-pub const DEFAULT_MAX_DEPTH: usize = 8;
-
-/// Check if model supports reasoning_effort parameter
-fn is_reasoning_model(model: &str) -> bool {
-    model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.starts_with("gpt-5")
+/// A client-side tool definition supplied with a request.
+///
+/// Used to register passthrough tools on the agent — the LLM sees them as
+/// callable, but `call()` returns `PASSTHROUGH_MARKER` and the streaming layer
+/// terminates the stream with `finish_reason: "tool_calls"` so the client can
+/// execute the tool locally and submit results back in a follow-up request.
+#[derive(Debug, Clone)]
+pub struct ClientTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
-/// Build Ollama-specific parameters for the agent builder.
+/// Default maximum depth for multi-turn conversations.
 ///
-/// Combines `num_ctx`, `num_predict`, and any `additional_params` into a single
-/// JSON object that gets passed to Rig's `additional_params()` method.
-///
-/// Returns `None` if no parameters are set.
-fn build_ollama_params(
-    num_ctx: Option<u32>,
-    num_predict: Option<u32>,
-    additional_params: Option<std::collections::HashMap<String, serde_json::Value>>,
-) -> Option<serde_json::Value> {
-    let mut params = serde_json::Map::new();
+/// This is the system-wide fallback when `[agent].turn_depth` is not set in TOML.
+/// Models with extended thinking (e.g. qwen3-coder) burn ReAct turns on reasoning
+/// before tool calls, so 12 gives adequate headroom.
+pub const DEFAULT_MAX_DEPTH: usize = 16;
 
-    if let Some(ctx) = num_ctx {
-        params.insert("num_ctx".to_string(), serde_json::json!(ctx));
-    }
-    if let Some(predict) = num_predict {
-        params.insert("num_predict".to_string(), serde_json::json!(predict));
-    }
-    if let Some(additional) = additional_params {
-        for (key, value) in additional {
-            params.insert(key, value);
+/// Shallow-merge two JSON values at the top level.
+///
+/// If both are objects, keys from `b` are inserted into `a` (overwriting on conflict).
+/// Otherwise, returns `a` unchanged.
+///
+/// Used to combine multiple sources of `additional_params` before passing to
+/// `AgentBuilder::additional_params()` which replaces (not merges) on each call.
+pub(crate) fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    match (a, b) {
+        (serde_json::Value::Object(mut a_map), serde_json::Value::Object(b_map)) => {
+            for (key, value) in b_map {
+                a_map.insert(key, value);
+            }
+            serde_json::Value::Object(a_map)
         }
+        (a, _) => a,
     }
+}
 
-    if params.is_empty() {
-        None
+/// Log tool count with optional filter indication
+fn log_filtered_tools(emoji: &str, transport: &str, server: &str, filtered: usize, total: usize) {
+    if filtered < total {
+        tracing::info!(
+            "{} Adding {}/{} {} tools from {}",
+            emoji,
+            filtered,
+            total,
+            transport,
+            server
+        );
     } else {
-        Some(serde_json::Value::Object(params))
+        tracing::info!(
+            "{} Adding {} {} tools from {}",
+            emoji,
+            total,
+            transport,
+            server
+        );
     }
 }
 
@@ -67,6 +89,22 @@ pub struct FilesystemTools {
     pub read_file: ReadFileTool,
     pub list_dir: ListDirTool,
     pub write_file: WriteFileTool,
+}
+
+/// Build a `StreamItem::ScratchpadUsage` for this agent's budget — `None` if
+/// the budget had no activity (no interception, no extraction). Pure decision
+/// helper shared by the single-agent stream tail and the orchestrator's
+/// per-worker emission so both paths stay in lock-step on the gating rule.
+pub(crate) fn scratchpad_usage_event(
+    budget: &scratchpad::ContextBudget,
+    agent_id: &str,
+) -> Option<StreamItem> {
+    let (intercepted, extracted) = budget.scratchpad_usage();
+    (intercepted > 0 || extracted > 0).then(|| StreamItem::ScratchpadUsage {
+        agent_id: agent_id.to_string(),
+        tokens_intercepted: intercepted,
+        tokens_extracted: extracted,
+    })
 }
 
 /// Rig-native agent wrapper using provider-specific agents.
@@ -84,26 +122,172 @@ pub struct FilesystemTools {
 ///    patterns (JSON/XML), and executes via `McpManager::execute_fallback_tool()`.
 ///    This bypasses Rig's tool infrastructure entirely.
 pub struct Agent {
-    inner: ProviderAgent,
-    model: String,
-    max_depth: usize,
-    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    pub(crate) inner: ProviderAgent,
+    pub(crate) model: String,
+    pub(crate) max_depth: usize,
+    pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Ollama text-to-tool parsing: when enabled, intercepts text output containing
     /// tool calls (JSON/XML) and executes them. Only applies to Ollama provider.
     /// See `maybe_wrap_with_fallback()` for the wrapping logic.
-    fallback_tool_parsing: bool,
+    pub(crate) fallback_tool_parsing: bool,
     /// Cached tool names for fallback parsing (avoids recomputing on each stream).
     /// Only populated when `fallback_tool_parsing` is enabled.
-    fallback_tool_names: Vec<String>,
-    /// Configured context window size in tokens (from TOML config).
+    pub(crate) fallback_tool_names: Vec<String>,
+    /// Configured context window size in tokens (from LLM TOML config).
     /// Used for usage percentage reporting in streaming events.
-    context_window: Option<u32>,
+    pub(crate) context_window: Option<u64>,
+    /// Per-agent scratchpad budget for context tracking.
+    /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
+    /// `None` for coordinator agents and non-scratchpad use.
+    pub(crate) scratchpad_budget: Option<scratchpad::ContextBudget>,
+    /// Names of client-side (passthrough) tools registered for this agent.
+    /// When the LLM calls one of these, the streaming layer terminates the
+    /// stream with `finish_reason: "tool_calls"` so the caller can execute
+    /// the tool and resume in a follow-up request.
+    pub(crate) client_tool_names: HashSet<String>,
 }
 
 impl Agent {
-    /// Create a new agent from configuration.
+    /// Wire up scratchpad for a single-agent config. Skipped in orchestration
+    /// mode (workers build their own per-worker budget in `create_worker()`)
+    /// and when no accessible MCP tool matches a scratchpad threshold.
+    ///
+    /// Per-request lifecycle: this runs inside `Agent::new`, which is called
+    /// fresh per chat request from
+    /// `aura-web-server::handlers::build_agent_for_request`. The `Agent` (and
+    /// this `ContextBudget`) is dropped when the request stream ends — there
+    /// is no cross-request budget state to manage. Request-specific data
+    /// (user query + chat history) is seeded into the budget at stream-start
+    /// in `Agent::stream_*_with_timeout`, not here, so this constructor
+    /// stays free of request-shape parameters.
+    async fn setup_single_agent_scratchpad(
+        config: &mut AgentConfig,
+        mcp_manager: Option<&Arc<McpManager>>,
+    ) -> Result<Option<scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
+        if config.orchestration_enabled() {
+            return Ok(None);
+        }
+
+        let sp_cfg = match config.agent.scratchpad.as_ref() {
+            Some(sp) if sp.enabled => sp.clone(),
+            _ => return Ok(None),
+        };
+
+        let tools_per_server = mcp_manager
+            .map(|mgr| mgr.tool_names_per_server())
+            .unwrap_or_default();
+        let scratchpad_tool_map =
+            scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
+        let accessible_tools = mcp_manager
+            .map(|mgr| mgr.get_available_tool_names())
+            .unwrap_or_default();
+        let filter = config
+            .mcp_filter
+            .as_deref()
+            .or(config.agent.mcp_filter.as_deref())
+            .unwrap_or(&[]);
+        if !scratchpad::has_accessible_scratchpad_tool(
+            &accessible_tools,
+            filter,
+            &scratchpad_tool_map,
+        ) {
+            tracing::info!(
+                "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping"
+            );
+            return Ok(None);
+        }
+
+        // Validation enforces these upstream; re-check here so runtime
+        // misconfiguration fails loudly instead of silently degrading.
+        let context_window = config.llm.context_window().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but [agent.llm].context_window is not set".into()
+            },
+        )? as usize;
+        let memory_dir = config
+            .effective_memory_dir()
+            .map(str::to_owned)
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but `memory_dir` is not set".into()
+            })?;
+
+        let (provider, model) = config.llm.model_info();
+        let token_counter = scratchpad::token_counter_for_provider(provider, model);
+
+        // Exact MCP tool-schema tokens (BPE on the JSON each tool serializes to).
+        // The user query and chat history aren't counted here; they're seeded into
+        // `estimated_used` at stream-start in `Agent::stream_*_with_timeout`
+        // (see `seed_scratchpad_request_input`), where they're naturally
+        // available without dirtying constructors with request data.
+        let mcp_tool_tokens = mcp_manager
+            .map(|m| {
+                scratchpad::count_mcp_tool_schema_tokens(
+                    &*token_counter,
+                    m.tool_definitions_iter(),
+                    filter,
+                )
+            })
+            .unwrap_or(0);
+
+        let initial_used = scratchpad::estimate_scratchpad_overhead(
+            &*token_counter,
+            &[config.effective_preamble()],
+        ) + mcp_tool_tokens;
+
+        let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            sp_cfg: &sp_cfg,
+            storage_dir: std::path::Path::new(&memory_dir),
+            scratchpad_tool_map,
+            context_window,
+            initial_used,
+            token_counter,
+        })
+        .await?;
+
+        // Order in vec controls reverse-iter `transform_output`: the LAST
+        // entry in the vec runs FIRST on raw output. Place `existing` after
+        // scratchpad so a caller-supplied wrapper observes the raw tool
+        // output (matches the orchestration convention where persistence-
+        // class wrappers go after scratchpad — see `create_worker`).
+        //
+        // Asymmetry callers should know about: `wrap_schema`, `transform_args`,
+        // and `validate_args` walk the vec forward, so `existing` sees a
+        // scratchpad-wrapped schema (extra fields injected) and scratchpad-
+        // stripped args (scratchpad fields removed) — not the raw MCP
+        // versions. Audit / logging wrappers are unaffected; a wrapper that
+        // introspects schema or transforms args needs to account for this.
+        // See `ComposedWrapper` docs and the lockdown test at the bottom of
+        // this module (`test_composed_scratchpad_then_existing_observes_raw_output`).
+        config.tool_wrapper = Some(match config.tool_wrapper.take() {
+            Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                build.wrapper,
+                existing,
+            ])),
+            None => build.wrapper,
+        });
+        config.preamble_override = Some(format!(
+            "{}{}",
+            config.effective_preamble(),
+            scratchpad::SCRATCHPAD_PREAMBLE
+        ));
+        config.scratchpad_tools_config = Some(build.tools_config);
+
+        Ok(Some(build.budget))
+    }
+
+    /// Create a new agent from configuration with optional additional tools.
+    ///
+    /// `additional_tools` registers extra rig tools the agent will execute itself
+    /// (e.g. tools other applications using Aura as a library want to expose).
+    /// Pass `vec![]` when no extra tools are needed.
+    ///
+    /// `client_tools` registers passthrough tools — the LLM sees them as callable,
+    /// but the streaming layer terminates the stream when one is invoked so the
+    /// client can execute the tool locally. Pass `None` to disable.
     pub async fn new(
         config: &AgentConfig,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+        client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
@@ -115,9 +299,33 @@ impl Agent {
             None
         };
 
-        // Get max depth for tool calls per turn
-        let max_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        // Clone so setup_single_agent_scratchpad can mutate extension fields
+        // (tool_wrapper, preamble_override, scratchpad_tools_config).
+        let mut config_owned = config.clone();
+        let agent_scratchpad_budget =
+            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+        let config = &config_owned;
+
+        // Scratchpad bonus only applies when scratchpad was actually wired up
+        // (enabled + context_window + a matching MCP tool).
+        let base_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = config
+            .scratchpad_tools_config
+            .as_ref()
+            .and(config.agent.scratchpad.as_ref())
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let max_depth = base_depth + scratchpad_bonus;
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "  Max turn depth: {} (base={}, scratchpad_bonus={})",
+                max_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        }
 
         // Ollama fallback: parse tool calls from text output when native tool_call
         // structures aren't used. Requires MCP tools to be available.
@@ -162,6 +370,9 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing OpenAI provider");
@@ -185,35 +396,41 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(effort) = config.agent.reasoning_effort {
-                    if is_reasoning_model(model) {
-                        let effort_str = match effort {
-                            crate::config::ReasoningEffort::Minimal => "minimal",
-                            crate::config::ReasoningEffort::Low => "low",
-                            crate::config::ReasoningEffort::Medium => "medium",
-                            crate::config::ReasoningEffort::High => "high",
-                        };
-                        agent_builder = agent_builder
-                            .additional_params(serde_json::json!({"reasoning_effort": effort_str}));
-                    } else {
-                        tracing::warn!(
-                            "reasoning_effort ignored for model '{}' (only supported on o1/o3/o4/gpt-5+)",
-                            model
-                        );
-                    }
+                // Build combined additional_params: reasoning_effort
+                // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
+                let mut combined_params: Option<serde_json::Value> = None;
+                if let Some(effort) = *reasoning_effort {
+                    combined_params =
+                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
                 }
-                if let Some(max) = config.agent.max_tokens {
+                if let Some(params) = additional_params {
+                    combined_params = Some(match combined_params {
+                        Some(existing) => merge_json(existing, params.clone()),
+                        None => params.clone(),
+                    });
+                }
+                if let Some(params) = combined_params {
+                    agent_builder = agent_builder.additional_params(params);
+                }
+
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
 
                 // Add tools using the BuilderState helper
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenAI(agent)
@@ -222,6 +439,8 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing Anthropic provider");
@@ -243,17 +462,26 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.agent.max_tokens {
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Anthropic(agent)
@@ -262,6 +490,8 @@ impl Agent {
                 model,
                 region,
                 profile,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing AWS Bedrock provider");
@@ -297,17 +527,26 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.agent.max_tokens {
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Bedrock(agent)
@@ -316,6 +555,8 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing Gemini provider");
@@ -335,14 +576,23 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
+                }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Gemini(agent)
@@ -350,8 +600,7 @@ impl Agent {
             LlmConfig::Ollama {
                 model,
                 base_url,
-                num_ctx,
-                num_predict,
+                temperature,
                 additional_params,
                 ..
             } => {
@@ -371,27 +620,34 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
 
-                // Build and apply Ollama-specific parameters (num_ctx, num_predict, etc.)
-                if let Some(ollama_params) =
-                    build_ollama_params(*num_ctx, *num_predict, additional_params.clone())
-                {
-                    tracing::info!("  Ollama params: {}", ollama_params);
-                    agent_builder = agent_builder.additional_params(ollama_params);
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Ollama(agent)
             }
         };
+
+        let client_tool_names = client_tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
 
         Ok(Agent {
             inner: provider_agent,
@@ -400,31 +656,81 @@ impl Agent {
             mcp_manager,
             fallback_tool_parsing,
             fallback_tool_names,
-            context_window: config.agent.context_window,
+            context_window: config.llm.context_window(),
+            scratchpad_budget: agent_scratchpad_budget,
+            client_tool_names,
         })
     }
 
+    /// Register passthrough tools so the LLM can request them, but execution
+    /// is deferred to the client.
+    ///
+    /// Each tool is wrapped in a `PassthroughTool` that returns
+    /// `PASSTHROUGH_MARKER` from `call()`; the streaming layer detects the
+    /// marker, suppresses the result, and emits `finish_reason: "tool_calls"`.
+    fn add_passthrough_tools<M>(
+        builder_state: BuilderState<M>,
+        client_tools: &[ClientTool],
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+    {
+        let mut state = builder_state;
+        for tool in client_tools {
+            tracing::info!("  Adding passthrough tool: {}", tool.name);
+            let passthrough = PassthroughTool::new(
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.parameters.clone(),
+            );
+            state = state.add_tool(passthrough);
+        }
+        state
+    }
+
     /// Add all tools to a builder state (shared across all providers)
-    async fn add_all_tools<M>(
+    ///
+    /// When `config.tool_wrapper` is set, MCP tools are wrapped with the provided
+    /// wrapper. The `config.tool_context_factory` is used to create context for each
+    /// wrapped tool call.
+    pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
         config: &AgentConfig,
         mcp_manager: &Option<Arc<McpManager>>,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
     where
         M: rig::completion::CompletionModel + Send + Sync,
     {
+        if config.tool_wrapper.is_some() {
+            tracing::info!("Tool wrapper configured");
+        }
+        let effective_filter = config
+            .mcp_filter
+            .as_ref()
+            .or(config.agent.mcp_filter.as_ref());
+        if let Some(patterns) = effective_filter {
+            tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
+        }
+
         // Add HTTP streamable tools using dynamic adaptors
         if let Some(mcp_manager) = mcp_manager.as_deref() {
             for (server_name, client) in &mcp_manager.streamable_clients {
                 if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
-                    tracing::info!(
-                        "Adding {} dynamic HTTP streamable tools from server: {}",
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "HTTP streamable",
+                        server_name,
+                        filtered_tools.len(),
                         server_tools.len(),
-                        server_name
                     );
 
                     let client_arc = Arc::new(client.clone());
-                    for mcp_tool in server_tools {
+                    for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
 
                         let tool_adaptor = crate::mcp_dynamic::HttpMcpToolAdaptor::new(
@@ -433,7 +739,8 @@ impl Agent {
                             client_arc.clone(),
                         );
 
-                        builder_state = builder_state.add_tool(tool_adaptor);
+                        // Wrap with tool_wrapper if configured
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -487,9 +794,17 @@ impl Agent {
         if let Some(mcp_manager) = mcp_manager.as_deref()
             && !mcp_manager.tool_definitions.is_empty()
         {
-            tracing::info!(
-                "Adding {} STDIO MCP tools",
-                mcp_manager.tool_definitions.len()
+            let filtered_definitions: Vec<_> = mcp_manager
+                .tool_definitions
+                .iter()
+                .filter(|(tool, _)| config.tool_matches_filter(&tool.name))
+                .collect();
+            log_filtered_tools(
+                "",
+                "STDIO",
+                "MCP servers",
+                filtered_definitions.len(),
+                mcp_manager.tool_definitions.len(),
             );
 
             // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
@@ -499,7 +814,7 @@ impl Agent {
                 (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
             > = HashMap::new();
 
-            for (tool, client) in &mcp_manager.tool_definitions {
+            for (tool, client) in filtered_definitions {
                 let client_key = format!("{client:?}");
                 tools_by_client
                     .entry(client_key)
@@ -514,7 +829,91 @@ impl Agent {
             }
         }
 
+        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            use crate::scratchpad::{
+                GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
+                SchemaTool, SliceTool,
+            };
+            tracing::info!(
+                "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
+            );
+            let s = &scratchpad.storage;
+            let b = &scratchpad.budget;
+            builder_state = builder_state
+                .add_tool(HeadTool::new(s.clone(), b.clone()))
+                .add_tool(SliceTool::new(s.clone(), b.clone()))
+                .add_tool(GrepTool::new(s.clone(), b.clone()))
+                .add_tool(SchemaTool::new(s.clone(), b.clone()))
+                .add_tool(ItemSchemaTool::new(s.clone(), b.clone()))
+                .add_tool(GetInTool::new(s.clone(), b.clone()))
+                .add_tool(IterateOverTool::new(s.clone(), b.clone()))
+                .add_tool(ReadTool::new(s.clone(), b.clone()));
+        }
+
+        // Add read_artifact tool when orchestration persistence is available
+        if let Some(ref persistence) = config.orchestration_persistence {
+            let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            builder_state = builder_state.add_tool(read_artifact);
+        }
+
+        // Add submit_result tool when orchestration submit decision is available
+        if let Some(ref decision) = config.orchestration_submit_result {
+            let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
+            builder_state = builder_state.add_tool(submit_tool);
+        }
+
+        // Add get_conversation_context tool when chat history is available
+        if let Some(ref history) = config.orchestration_chat_history {
+            let context_tool =
+                crate::orchestration::GetConversationContextTool::new(history.clone());
+            builder_state = builder_state.add_tool(context_tool);
+        }
+
+        // Add additional custom tools (e.g., CLI local tools in standalone mode)
+        if !additional_tools.is_empty() {
+            tracing::info!("Adding {} additional custom tools", additional_tools.len());
+            builder_state = builder_state.add_tools_dyn(additional_tools);
+        }
+
         Ok(builder_state)
+    }
+
+    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    ///
+    /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
+    /// created using `config.tool_context_factory` (or a default context).
+    fn add_mcp_tool<M, T>(
+        builder_state: BuilderState<M>,
+        tool: T,
+        config: &AgentConfig,
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+        T: rig::tool::Tool<Args = serde_json::Value, Output = String, Error = rig::tool::ToolError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        match (&config.tool_wrapper, &config.tool_context_factory) {
+            (Some(wrapper), Some(ctx_factory)) => {
+                // Wrap with both wrapper and context factory
+                let tool_name = tool.name();
+                let ctx_factory = ctx_factory.clone();
+                let wrapped = WrappedTool::new(tool, wrapper.clone())
+                    .with_context_factory(move |_| ctx_factory(&tool_name));
+                builder_state.add_tool(wrapped)
+            }
+            (Some(wrapper), None) => {
+                // Wrap with wrapper only (default context)
+                let wrapped = WrappedTool::new(tool, wrapper.clone());
+                builder_state.add_tool(wrapped)
+            }
+            _ => {
+                // No wrapping
+                builder_state.add_tool(tool)
+            }
+        }
     }
 
     /// Process a query with the agent (no chat history).
@@ -583,7 +982,7 @@ impl Agent {
                     usage = response.usage;
                     break;
                 }
-                Ok(StreamItem::FinalMarker) => {
+                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(_)) => {
                     // Per-turn marker — not end-of-stream. Continue collecting.
                 }
                 Ok(_) => {
@@ -619,6 +1018,40 @@ impl Agent {
             .stream_chat(query, chat_history, self.max_depth)
             .await;
         self.maybe_wrap_with_fallback(stream)
+    }
+
+    /// Stream a chat with explicit max_depth override.
+    ///
+    /// Unlike `stream_chat()` which uses `self.max_depth`, this allows callers
+    /// to specify depth. Used by orchestration phases that need tighter bounds.
+    #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
+        fields(model = %self.model, history_len = chat_history.len(), max_depth))]
+    pub async fn stream_chat_with_depth(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+        max_depth: usize,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let stream = self.inner.stream_chat(query, chat_history, max_depth).await;
+        self.maybe_wrap_with_fallback(stream)
+    }
+
+    /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
+    /// scratchpad budget with non-zero activity. Mirrors the per-worker event
+    /// the orchestrator emits after each task — the web server handler
+    /// converts this into the `aura.scratchpad_usage` SSE event for the UI.
+    fn append_scratchpad_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let Some(budget) = self.scratchpad_budget.clone() else {
+            return stream;
+        };
+        let tail = futures::stream::once(async move { scratchpad_usage_event(&budget, "main") })
+            .filter_map(|opt| async move { opt.map(Ok) });
+        Box::pin(stream.chain(tail))
     }
 
     /// Conditionally wrap stream for Ollama text-to-tool parsing.
@@ -691,12 +1124,20 @@ impl Agent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
+        self.seed_scratchpad_request_input(query, &[]);
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id)
+            .stream_prompt_with_timeout(
+                query,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+                self.client_tool_names.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
@@ -728,15 +1169,47 @@ impl Agent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
+        self.seed_scratchpad_request_input(query, &chat_history);
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_chat_with_timeout(query, chat_history, self.max_depth, timeout, request_id)
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+                self.client_tool_names.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
+    }
+
+    /// Seed the scratchpad budget's running estimate with the user query +
+    /// chat history at stream-start so early extraction budget checks see
+    /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
+    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
+    /// over-counts vs. per-provider serialization — conservative direction
+    /// for budget gating, and `set_estimated_used` corrects from LLM ground
+    /// truth after each turn anyway.
+    fn seed_scratchpad_request_input(
+        &self,
+        query: &str,
+        chat_history: &[rig::completion::Message],
+    ) {
+        let Some(budget) = &self.scratchpad_budget else {
+            return;
+        };
+        let query_tokens = budget.count_tokens(query);
+        let history_tokens: usize = chat_history
+            .iter()
+            .map(|m| budget.count_tokens(&format!("{m:?}")))
+            .sum();
+        budget.record_usage(query_tokens + history_tokens);
     }
 
     /// Get provider information
@@ -792,28 +1265,6 @@ impl Agent {
         }
     }
 
-    /// Set the current HTTP request ID on all MCP clients.
-    ///
-    /// Call this before starting a streaming request. All subsequent tool calls
-    /// will automatically be tracked under this request ID for cancellation support.
-    ///
-    /// This is more reliable than thread-local storage because Rig spawns tool
-    /// execution in separate tasks where thread-local doesn't propagate.
-    pub async fn set_mcp_request_id(&self, http_request_id: &str) {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(http_request_id).await;
-        }
-    }
-
-    /// Clear the current HTTP request ID on all MCP clients.
-    ///
-    /// Call this after a streaming request completes (successfully or otherwise).
-    pub async fn clear_mcp_request_id(&self) {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.clear_current_request().await;
-        }
-    }
-
     /// Get all available tool names from MCP servers.
     ///
     /// Returns a list of tool names that can be used for fallback tool execution.
@@ -827,11 +1278,6 @@ impl Agent {
     /// Get reference to the MCP manager (if configured).
     pub fn mcp_manager(&self) -> Option<&McpManager> {
         self.mcp_manager.as_deref()
-    }
-
-    /// Get the configured context window size in tokens.
-    pub fn context_window(&self) -> Option<u32> {
-        self.context_window
     }
 }
 
@@ -900,13 +1346,21 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 impl StreamingAgent for Agent {
+    fn get_provider_info(&self) -> (&str, &str) {
+        Agent::get_provider_info(self)
+    }
+
     async fn stream(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         _cancel_token: CancellationToken,
+        request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
-        // Use the appropriate method based on whether we have chat history
+        if let Some(mcp_manager) = &self.mcp_manager {
+            mcp_manager.set_current_request(request_id).await;
+        }
+
         let stream = if chat_history.is_empty() {
             self.stream_prompt(query).await
         } else {
@@ -925,11 +1379,14 @@ impl StreamingAgent for Agent {
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
+        crate::UsageState,
     ) {
-        // Use the appropriate method based on whether we have chat history
-        // Note: We discard usage_state here as this trait method doesn't expose it.
-        // Callers needing usage_state should use stream_prompt_with_timeout/stream_chat_with_timeout directly.
-        let (stream, cancel_tx, _usage_state) = if chat_history.is_empty() {
+        // Production entry point — set MCP request ID before delegating
+        if let Some(mcp_manager) = &self.mcp_manager {
+            mcp_manager.set_current_request(request_id).await;
+        }
+
+        let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
                 .await
         } else {
@@ -937,7 +1394,61 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        (Box::pin(stream), cancel_tx)
+        (Box::pin(stream), cancel_tx, usage_state)
+    }
+
+    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
+        Agent::cancel_and_close_mcp(self, request_id, reason).await
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+}
+
+/// Build the appropriate streaming agent based on configuration.
+///
+/// Returns either an orchestrated multi-agent workflow or a standard single
+/// agent, depending on `orchestration.enabled`. Both implement `StreamingAgent`.
+///
+/// `client_tools` is the request-supplied passthrough tool definitions.
+/// **Client-side tools are only supported in single-agent mode** — when
+/// `orchestration.enabled = true`, any supplied `client_tools` are dropped
+/// with a warning. In single-agent mode, they are attached to the agent only
+/// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
+pub async fn build_streaming_agent(
+    config: &crate::config::AgentConfig,
+    client_tools: Option<Vec<ClientTool>>,
+) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::orchestration::OrchestratorFactory;
+
+    if config.orchestration_enabled() {
+        tracing::info!("Building OrchestratorFactory (orchestration.enabled = true)");
+        if client_tools.as_ref().is_some_and(|t| !t.is_empty()) {
+            tracing::warn!(
+                "Client-side tools were supplied but orchestration is enabled — \
+                 client tools are only supported in single-agent configurations and \
+                 will be ignored. Use a non-orchestrated agent config to enable them."
+            );
+        }
+        let factory = OrchestratorFactory::new(config.clone());
+        Ok(Arc::new(factory))
+    } else {
+        // Standard single-agent mode: gate client tools on the agent's TOML opt-in
+        // and apply its client_tool_filter.
+        tracing::info!("Building Agent (orchestration.enabled = false)");
+        let attached = if config.agent.enable_client_tools {
+            client_tools.map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|t| config.client_tool_matches_filter(&t.name))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        let agent = Agent::new(config, vec![], attached).await?;
+        Ok(Arc::new(agent))
     }
 }
 
@@ -998,6 +1509,7 @@ impl AgentBuilder {
                         args,
                         env,
                         description,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (STDIO):", name);
                         tracing::info!("  Command: {:?}", cmd);
@@ -1012,6 +1524,7 @@ impl AgentBuilder {
                         headers,
                         description,
                         headers_from_request,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
                         tracing::info!("  URL: {}", url);
@@ -1079,12 +1592,208 @@ impl AgentBuilder {
     pub async fn build_agent(&self) -> BuilderResult<Agent> {
         tracing::info!("=== Building Agent ===");
 
-        let agent = Agent::new(&self.config)
+        let agent = Agent::new(&self.config, vec![], None)
             .await
             .map_err(|e| BuilderError::AgentError(e.to_string()))?;
 
         tracing::info!("Agent built successfully with full tool integration");
 
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scratchpad::TiktokenCounter;
+
+    fn budget() -> scratchpad::ContextBudget {
+        let counter = Arc::new(TiktokenCounter::default_counter());
+        scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
+    }
+
+    #[test]
+    fn scratchpad_usage_event_returns_none_when_no_activity() {
+        let b = budget();
+        assert!(scratchpad_usage_event(&b, "main").is_none());
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_intercepted_is_set() {
+        let b = budget();
+        b.record_intercepted(500);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when intercepted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            } => {
+                assert_eq!(agent_id, "main");
+                assert_eq!(tokens_intercepted, 500);
+                assert_eq!(tokens_extracted, 0);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_extracted_is_set() {
+        let b = budget();
+        b.record_extracted(200);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when extracted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                tokens_intercepted,
+                tokens_extracted,
+                ..
+            } => {
+                assert_eq!(tokens_intercepted, 0);
+                assert_eq!(tokens_extracted, 200);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_uses_provided_agent_id() {
+        let b = budget();
+        b.record_intercepted(1);
+        let event = scratchpad_usage_event(&b, "data-explorer").expect("must emit");
+        match event {
+            StreamItem::ScratchpadUsage { agent_id, .. } => {
+                assert_eq!(agent_id, "data-explorer");
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    /// End-to-end ordering test for the single-agent wrapper composition at
+    /// `setup_single_agent_scratchpad` (this file). Mirrors the orchestration
+    /// lockdown in `persistence_wrapper.rs::test_composed_persistence_after_scratchpad_captures_raw`.
+    ///
+    /// Locks down two related contracts that builder.rs:230 relies on:
+    /// 1. **Output runs reverse**: a caller-supplied `existing` wrapper placed
+    ///    after `ScratchpadWrapper` in the vec sees the **raw** tool output;
+    ///    scratchpad runs second and rewrites the LLM-facing output to a
+    ///    pointer.
+    /// 2. **Schema/args run forward**: `existing` sees whatever scratchpad
+    ///    emitted from `wrap_schema`/`transform_args`. Today scratchpad is a
+    ///    pass-through there, so this asserts identity. If scratchpad ever
+    ///    starts modifying schema or args, this test fails and forces a
+    ///    review of the asymmetry doc (see `ComposedWrapper` and the comment
+    ///    above the `Some(existing) => ...` arm in `setup_single_agent_scratchpad`).
+    ///
+    /// A reorder of the vec, a flip in `ComposedWrapper`'s iteration
+    /// direction, or a new transform inside `ScratchpadWrapper::wrap_schema`/
+    /// `transform_args` will all surface here.
+    #[tokio::test]
+    async fn test_composed_scratchpad_then_existing_observes_raw_output() {
+        use crate::mcp_response::CallOutcome;
+        use crate::scratchpad::{ScratchpadStorage, ScratchpadWrapper};
+        use crate::tool_wrapper::{
+            ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult,
+            TransformOutputResult,
+        };
+        use async_trait::async_trait;
+        use serde_json::Value;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// Fake "caller-supplied" wrapper that records what each composition
+        /// step hands it. Lets the test assert exactly what the existing
+        /// wrapper observes under the documented composition order.
+        #[derive(Default)]
+        struct RecordingWrapper {
+            schema_seen: Mutex<Option<Value>>,
+            args_seen: Mutex<Option<Value>>,
+            output_seen: Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl ToolWrapper for RecordingWrapper {
+            fn wrap_schema(&self, schema: Value) -> Value {
+                *self.schema_seen.lock().unwrap() = Some(schema.clone());
+                schema
+            }
+
+            fn transform_args(&self, args: Value, _ctx: &ToolCallContext) -> TransformArgsResult {
+                *self.args_seen.lock().unwrap() = Some(args.clone());
+                TransformArgsResult::new(args)
+            }
+
+            fn transform_output(
+                &self,
+                output: String,
+                _outcome: &CallOutcome,
+                _ctx: &ToolCallContext,
+                _extracted: Option<&Value>,
+            ) -> TransformOutputResult {
+                *self.output_seen.lock().unwrap() = Some(output.clone());
+                TransformOutputResult::new(output)
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-single-compose")
+                .await
+                .unwrap(),
+        );
+        let counter = TiktokenCounter::default_counter();
+        let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+
+        let scratchpad_tools = HashMap::from([("big_tool".to_string(), 10_usize)]);
+        let scratchpad: Arc<dyn ToolWrapper> =
+            Arc::new(ScratchpadWrapper::new(scratchpad_tools, storage, sp_budget));
+
+        let recording = Arc::new(RecordingWrapper::default());
+        let recording_dyn: Arc<dyn ToolWrapper> = recording.clone();
+
+        // Same ordering as `setup_single_agent_scratchpad`: scratchpad first,
+        // existing (recording) last → reverse iter on transform_output runs
+        // recording first → recording sees raw → scratchpad rewrites to pointer.
+        let composed = ComposedWrapper::new(vec![scratchpad, recording_dyn]);
+
+        // Forward iter: scratchpad's wrap_schema runs first, then recording.
+        let original_schema = serde_json::json!({"type": "object", "properties": {}});
+        let _ = composed.wrap_schema(original_schema.clone());
+        assert_eq!(
+            recording.schema_seen.lock().unwrap().as_ref(),
+            Some(&original_schema),
+            "ScratchpadWrapper should be a passthrough for wrap_schema; \
+             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
+             needs a re-read because existing wrappers will now see a modified schema",
+        );
+
+        // Forward iter: scratchpad's transform_args runs first, then recording.
+        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "single_agent".into(), 0);
+        let original_args = serde_json::json!({"input": "hello"});
+        let _ = composed.transform_args(original_args.clone(), &ctx);
+        assert_eq!(
+            recording.args_seen.lock().unwrap().as_ref(),
+            Some(&original_args),
+            "ScratchpadWrapper should be a passthrough for transform_args; \
+             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
+             needs a re-read because existing wrappers will now see modified args",
+        );
+
+        // Reverse iter: recording's transform_output runs first on RAW output,
+        // then scratchpad runs on recording's pass-through output and rewrites
+        // it to a pointer.
+        let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
+        let outcome = CallOutcome::Success(raw.clone());
+        let result = composed.transform_output(raw.clone(), &outcome, &ctx, None);
+
+        assert_eq!(
+            recording.output_seen.lock().unwrap().as_deref(),
+            Some(raw.as_str()),
+            "existing wrapper must see RAW output, not the scratchpad pointer",
+        );
+        assert!(
+            result.output.contains("[scratchpad:"),
+            "scratchpad must rewrite the LLM-facing output to a pointer, got: {}",
+            &result.output[..result.output.len().min(120)]
+        );
     }
 }

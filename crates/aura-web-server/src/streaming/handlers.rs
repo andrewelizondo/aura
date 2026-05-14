@@ -22,17 +22,18 @@ use crate::streaming::types::openai::UsageInfo;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
-    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, FunctionCallChunk, MessageRole,
-    StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus, TurnContext, TurnState,
-    detect_tool_error, format_sse_chunk, truncate_result,
+    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FINISH_REASON_TOOL_CALLS, FUNCTION_TYPE,
+    FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
+    TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
-use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    Agent, ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
-    StreamedAssistantContent, StreamedUserContent, ToolCall, ToolLifecycleEvent, ToolResult,
-    ToolUsageEvent, UsageState,
+    EventContext, OrchestrationStreamEvent, OrchestratorEvent, PASSTHROUGH_MARKER,
+    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent,
+    ToolResult, ToolUsageEvent, UsageState,
 };
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +44,7 @@ pub struct StreamingCallbacks {
     /// Request ID for cancellation registry
     pub request_id: String,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
-    pub agent: Arc<Agent>,
+    pub agent: Arc<dyn StreamingAgent>,
     /// MCP tool event receiver (for aura.tool_requested and aura.tool_start events)
     pub tool_event_rx: mpsc::Receiver<ToolLifecycleEvent>,
     /// MCP progress event receiver (for aura.progress events)
@@ -517,6 +518,19 @@ fn process_stream_next(
         }
         Some(Err(e)) => {
             let error_str = e.to_string();
+
+            // Client-tool passthrough path: when the LLM invokes a passthrough
+            // tool, the streaming hook cancels the stream before the next LLM
+            // turn so the client can execute the tool. That cancellation
+            // surfaces here as an error — treat it as normal end-of-stream.
+            if config.has_client_tools && state.has_passthrough_tool_calls {
+                tracing::info!(
+                    "Stream cancelled after client tool call (expected): {}",
+                    error_str
+                );
+                return NextItemResult::End(vec![]);
+            }
+
             tracing::error!("Stream error: {}", error_str);
 
             // Capture for OTel span recording after loop ends
@@ -586,10 +600,35 @@ fn handle_stream_item(
 
             vec![]
         }
-        StreamItem::FinalMarker => {
-            // Internal marker - filtered out
-            tracing::debug!("Received final marker");
+        StreamItem::FinalMarker | StreamItem::TurnUsage(_) => {
+            // Internal markers - filtered out
+            tracing::debug!("Received final/turn-usage marker");
             vec![]
+        }
+        StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
+        StreamItem::ScratchpadUsage {
+            agent_id,
+            tokens_intercepted,
+            tokens_extracted,
+        } => {
+            tracing::debug!(
+                "Scratchpad usage for agent {}: intercepted=~{} tokens, extracted=~{} tokens",
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            );
+            let agent_ctx = aura::stream_events::AgentContext {
+                agent_id: agent_id.clone(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            let event = AuraStreamEvent::scratchpad_usage(
+                *tokens_intercepted,
+                *tokens_extracted,
+                agent_ctx,
+                ctx.correlation.clone(),
+            );
+            vec![Bytes::from(event.format_sse())]
         }
     }
 }
@@ -682,13 +721,31 @@ fn handle_tool_call(
 ) -> Vec<Bytes> {
     tracing::info!("Streaming tool call: {}", tool_call.name);
 
-    let mut output = Vec::with_capacity(2);
-
-    state.has_tool_calls = true;
+    // Record the id → name mapping for handle_tool_result regardless of
+    // suppression so the matching result can identify itself as scratchpad.
     state.tool_call_map.insert(
         tool_call.id.clone(),
         (tool_call.name.clone(), state.tool_call_index),
     );
+
+    // Suppress scratchpad exploration tools to match orchestration behavior.
+    // Orchestration's worker loop absorbs all ToolCall/ToolResult items, and
+    // its `ObserverWrapper` doesn't wrap scratchpad tools — so they never
+    // surface in `aura.orchestrator.tool_call_*`. The SSE handler is the
+    // single-agent equivalent surface, and `StreamingRequestHook` already
+    // suppresses `aura.tool_requested` for the same set.
+    //
+    // Debug override: `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` disables this
+    // suppression so callers can see scratchpad calls in the SSE stream.
+    if aura::scratchpad::is_scratchpad_tool(&tool_call.name)
+        && !aura::scratchpad::emit_scratchpad_tool_events_enabled()
+    {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(2);
+
+    state.has_tool_calls = true;
 
     // Track tool start time for duration calculation in tool_complete event
     // Note: aura.tool_requested is emitted via StreamingRequestHook → tool_event_rx channel (not here)
@@ -751,6 +808,37 @@ fn handle_tool_result(
         tool_result.id,
         tool_result.call_id
     );
+
+    // Passthrough (client-side) tool: the result is a synthetic marker, not
+    // real output. Suppress it from the stream and flag the turn so the final
+    // chunk uses `finish_reason: "tool_calls"` and the cancellation that
+    // follows (via the streaming hook) is treated as normal termination.
+    if tool_result.result.contains(PASSTHROUGH_MARKER) {
+        tracing::info!(
+            "Passthrough tool result detected for call {} — suppressing from stream",
+            tool_result.id
+        );
+        state.has_passthrough_tool_calls = true;
+        return vec![];
+    }
+
+    // Mirror the suppression in `handle_tool_call`: scratchpad exploration
+    // tools are absorbed end-to-end so single-agent matches orchestration.
+    // `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` disables this for debugging.
+    let is_scratchpad = state
+        .tool_call_map
+        .get(&tool_result.id)
+        .or_else(|| {
+            tool_result
+                .call_id
+                .as_ref()
+                .and_then(|cid| state.tool_call_map.get(cid))
+        })
+        .map(|(name, _)| aura::scratchpad::is_scratchpad_tool(name))
+        .unwrap_or(false);
+    if is_scratchpad && !aura::scratchpad::emit_scratchpad_tool_events_enabled() {
+        return Vec::new();
+    }
 
     let mut output = Vec::with_capacity(2);
     state.needs_separator = true;
@@ -893,6 +981,242 @@ fn handle_reasoning(config: &StreamConfig, ctx: &TurnContext, reasoning: String)
     }
 }
 
+/// Convert a non-empty string to `Some(truncated)`, or `None` if empty.
+fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(truncate_result(s, max_len))
+    }
+}
+
+fn handle_orchestrator_event(
+    config: &StreamConfig,
+    ctx: &TurnContext,
+    event: &OrchestratorEvent,
+) -> Vec<Bytes> {
+    if !config.emit_custom_events {
+        tracing::debug!(
+            "Orchestrator event skipped (custom events disabled): {:?}",
+            event
+        );
+        return vec![];
+    }
+
+    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+
+    let sse_event: OrchestrationStreamEvent = match event {
+        OrchestratorEvent::PlanCreated {
+            goal,
+            tasks,
+            routing_mode,
+            routing_rationale,
+            planning_response,
+        } => {
+            tracing::debug!(
+                "Orchestrator: plan created with {} tasks for goal: {} (routing={:?}, rationale: {})",
+                tasks.len(),
+                goal,
+                routing_mode,
+                routing_rationale
+            );
+            OrchestrationStreamEvent::plan_created(
+                goal,
+                tasks.clone(),
+                routing_mode.clone(),
+                routing_rationale,
+                if planning_response.is_empty() {
+                    None
+                } else {
+                    Some(planning_response.to_string())
+                },
+                event_context,
+            )
+        }
+        OrchestratorEvent::DirectAnswer {
+            response,
+            routing_rationale,
+        } => {
+            tracing::debug!(
+                "Orchestrator: direct answer (rationale: {})",
+                routing_rationale
+            );
+            OrchestrationStreamEvent::direct_answer(response, routing_rationale, event_context)
+        }
+        OrchestratorEvent::ClarificationNeeded {
+            question,
+            options,
+            routing_rationale,
+        } => {
+            tracing::debug!(
+                "Orchestrator: clarification needed - {} (rationale: {})",
+                question,
+                routing_rationale
+            );
+            OrchestrationStreamEvent::clarification_needed(
+                question,
+                options.clone(),
+                routing_rationale,
+                event_context,
+            )
+        }
+        OrchestratorEvent::TaskStarted {
+            task_id,
+            description,
+            orchestrator_id,
+            worker_id,
+        } => {
+            tracing::debug!("Orchestrator: task {} started - {}", task_id, description);
+            OrchestrationStreamEvent::task_started(
+                *task_id,
+                description,
+                orchestrator_id,
+                worker_id,
+                event_context,
+            )
+        }
+        OrchestratorEvent::TaskCompleted {
+            task_id,
+            success,
+            duration_ms,
+            orchestrator_id,
+            worker_id,
+            result,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {} completed (success={}) in {}ms",
+                task_id,
+                success,
+                duration_ms
+            );
+            OrchestrationStreamEvent::task_completed(
+                *task_id,
+                *success,
+                *duration_ms,
+                orchestrator_id,
+                worker_id,
+                maybe_truncate(result, config.tool_result_max_length),
+                event_context,
+            )
+        }
+        OrchestratorEvent::IterationComplete {
+            iteration,
+            will_replan,
+            reasoning,
+            gaps,
+        } => {
+            tracing::debug!(
+                "Orchestrator: iteration {} complete (will_replan={})",
+                iteration,
+                will_replan
+            );
+            OrchestrationStreamEvent::iteration_complete(
+                *iteration,
+                *will_replan,
+                if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning.to_string())
+                },
+                gaps.clone(),
+                event_context,
+            )
+        }
+        OrchestratorEvent::ReplanStarted { iteration, trigger } => {
+            tracing::debug!(
+                "Orchestrator: replan started (iteration={}, trigger={})",
+                iteration,
+                trigger
+            );
+            OrchestrationStreamEvent::replan_started(*iteration, trigger, event_context)
+        }
+        OrchestratorEvent::Synthesizing { iteration } => {
+            tracing::debug!(
+                "Orchestrator: consolidating results for coordinator (iteration={})",
+                iteration
+            );
+            OrchestrationStreamEvent::synthesizing(*iteration, event_context)
+        }
+        OrchestratorEvent::WorkerReasoning {
+            task_id,
+            worker_id,
+            content,
+        } => {
+            if !config.emit_custom_events || !config.emit_reasoning {
+                return vec![];
+            }
+            tracing::debug!(
+                "Orchestrator: worker reasoning (task={}, worker={})",
+                task_id,
+                worker_id
+            );
+            // Emit as aura.orchestrator.worker_reasoning (orchestration event)
+            let orch_event = OrchestrationStreamEvent::worker_reasoning(
+                *task_id,
+                worker_id,
+                content,
+                event_context.clone(),
+            );
+            let mut bytes = vec![Bytes::from(orch_event.format_sse())];
+            // Also emit as aura.reasoning with agent_id set to the worker name
+            // for backward-compatible reasoning aggregation
+            let worker_agent =
+                aura::stream_events::AgentContext::worker(worker_id, None, "coordinator");
+            let reasoning_event =
+                AuraStreamEvent::reasoning(content, worker_agent, ctx.correlation.clone());
+            bytes.push(Bytes::from(reasoning_event.format_sse()));
+            return bytes;
+        }
+        OrchestratorEvent::ToolCallStarted {
+            task_id,
+            tool_call_id,
+            tool_name,
+            worker_id,
+            arguments,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {:?} tool call started - {} ({})",
+                task_id,
+                tool_name,
+                tool_call_id
+            );
+            OrchestrationStreamEvent::tool_call_started(
+                *task_id,
+                tool_call_id,
+                tool_name,
+                worker_id,
+                Some(arguments.clone()),
+                event_context,
+            )
+        }
+        OrchestratorEvent::ToolCallCompleted {
+            task_id,
+            tool_call_id,
+            success,
+            duration_ms,
+            result,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
+                task_id,
+                tool_call_id,
+                success,
+                duration_ms
+            );
+            OrchestrationStreamEvent::tool_call_completed(
+                *task_id,
+                tool_call_id,
+                *success,
+                *duration_ms,
+                maybe_truncate(result, config.tool_result_max_length),
+                event_context,
+            )
+        }
+    };
+
+    vec![Bytes::from(sse_event.format_sse())]
+}
+
 fn is_context_overflow_error(error_str: &str) -> bool {
     let lower = error_str.to_lowercase();
     lower.contains("context_length_exceeded")
@@ -929,7 +1253,12 @@ fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCom
 
 /// Build the final chunk with finish_reason.
 fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
-    let finish_reason = if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
+    let finish_reason = if state.has_passthrough_tool_calls {
+        // The LLM invoked a client-side tool — tell the client to execute it
+        // and follow up. Takes precedence over `length` because the request
+        // is logically incomplete: the client owes us a tool result.
+        FINISH_REASON_TOOL_CALLS
+    } else if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
         if usage.completion_tokens >= max as u64 {
             FINISH_REASON_LENGTH
         } else {
@@ -968,7 +1297,7 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::stream_events::{AgentContext, CorrelationContext, event_names};
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
     /// The aura.tool_requested event is emitted via StreamingRequestHook → tool_event_rx channel
@@ -981,6 +1310,7 @@ mod tests {
             tool_result_mode: ToolResultMode::None,
             tool_result_max_length: 1000,
             fallback_tool_parsing: false,
+            has_client_tools: false,
         };
 
         let ctx = TurnContext {
@@ -1011,7 +1341,7 @@ mod tests {
         // Verify NO aura.tool_requested event is emitted
         // (it should come via tool_event_rx channel from StreamingRequestHook, not here)
         assert!(
-            !output_str.contains("aura.tool_requested"),
+            !output_str.contains(event_names::TOOL_REQUESTED),
             "handle_tool_call should NOT emit aura.tool_requested directly - \
              it's emitted via StreamingRequestHook → tool_event_rx channel. Found: {}",
             output_str

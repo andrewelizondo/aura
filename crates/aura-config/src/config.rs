@@ -1,27 +1,318 @@
-use aura::config::lenient_int;
+use aura::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+use aura::{LlmConfig, lenient_int};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Reasoning effort level for GPT-5 models
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Minimal,
-    Low,
-    Medium,
-    High,
-}
 
 /// Root configuration structure for our POC
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Config {
-    pub llm: LlmConfig,
+    /// Top-level persistence directory shared by scratchpad and orchestration
+    /// artifacts. `[orchestration.artifacts].memory_dir` is honored as a
+    /// legacy fallback.
+    #[serde(default)]
+    pub memory_dir: Option<String>,
     pub mcp: Option<McpConfig>,
     /// Vector stores for RAG - optional, defaults to empty
     #[serde(default)]
     pub vector_stores: Vec<VectorStoreConfig>,
     pub tools: Option<ToolsConfig>,
     pub agent: AgentConfig,
+    /// Orchestration mode configuration (multi-agent workflows)
+    #[serde(default)]
+    pub orchestration: Option<OrchestrationConfig>,
+}
+
+/// Per-worker configuration for specialized workers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// Short description for planning prompt.
+    pub description: String,
+    /// System prompt for this worker.
+    pub preamble: String,
+    /// Glob patterns for which MCP tools this worker gets access to.
+    #[serde(default)]
+    pub mcp_filter: Vec<String>,
+    /// Vector stores this worker has access to (explicit names).
+    #[serde(default)]
+    pub vector_stores: Vec<String>,
+    /// Per-worker turn depth limit (overrides [agent].turn_depth).
+    #[serde(default)]
+    pub turn_depth: Option<usize>,
+    /// Optional per-worker LLM override.
+    ///
+    /// When set, the worker uses this LLM configuration instead of inheriting
+    /// `[agent.llm]`. This enables mixed-model orchestration — e.g. using a
+    /// cheaper model for simple tasks and a stronger one for complex analysis.
+    /// `context_window` comes from the resolved LLM, so worker budget math is
+    /// scoped to whichever model the worker actually runs.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
+    /// Per-worker override of `[agent.scratchpad]`. Parsed from
+    /// `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
+}
+
+/// Timeout configuration for orchestration (aura-config side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    #[serde(default = "default_per_call_timeout_secs")]
+    pub per_call_timeout_secs: u64,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            per_call_timeout_secs: default_per_call_timeout_secs(),
+        }
+    }
+}
+
+/// Artifact configuration for orchestration (aura-config side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactsConfig {
+    #[serde(default, alias = "memory_path")]
+    pub memory_dir: Option<String>,
+    #[serde(default = "default_result_artifact_threshold")]
+    pub result_artifact_threshold: usize,
+    #[serde(default = "default_result_summary_length")]
+    pub result_summary_length: usize,
+    #[serde(default = "default_session_history_turns")]
+    pub session_history_turns: usize,
+    #[serde(default = "default_persistence_drain_timeout_ms")]
+    pub persistence_drain_timeout_ms: u64,
+    #[serde(default = "default_tool_output_artifact_threshold")]
+    pub tool_output_artifact_threshold: usize,
+    #[serde(default = "default_tool_output_duration_threshold_ms")]
+    pub tool_output_duration_threshold_ms: u64,
+    #[serde(default)]
+    pub show_tool_reasoning_in_continuation: bool,
+    #[serde(default = "default_max_session_runs")]
+    pub max_session_runs: usize,
+}
+
+fn default_max_session_runs() -> usize {
+    20
+}
+
+fn default_session_history_turns() -> usize {
+    3
+}
+
+fn default_persistence_drain_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_tool_output_artifact_threshold() -> usize {
+    500
+}
+
+fn default_tool_output_duration_threshold_ms() -> u64 {
+    5000
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            memory_dir: None,
+            result_artifact_threshold: default_result_artifact_threshold(),
+            result_summary_length: default_result_summary_length(),
+            session_history_turns: default_session_history_turns(),
+            persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
+            tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
+            tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
+            show_tool_reasoning_in_continuation: false,
+            max_session_runs: default_max_session_runs(),
+        }
+    }
+}
+
+/// Configuration for orchestration mode.
+///
+/// Uses custom deserialization for backward compatibility with flat field format.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationConfig {
+    pub enabled: bool,
+    pub max_planning_cycles: usize,
+    pub max_plan_parse_retries: usize,
+    pub worker_system_prompt: Option<String>,
+    pub workers: HashMap<String, WorkerConfig>,
+    pub coordinator_vector_stores: Vec<String>,
+    pub allow_direct_answers: bool,
+    pub allow_clarification: bool,
+    pub tools_in_planning: ToolVisibility,
+    pub max_tools_per_worker: usize,
+    pub duplicate_call_nudge_threshold: usize,
+    pub duplicate_call_block_threshold: usize,
+    pub timeouts: TimeoutsConfig,
+    pub artifacts: ArtifactsConfig,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_planning_cycles: default_max_planning_cycles(),
+            max_plan_parse_retries: default_max_plan_parse_retries(),
+            worker_system_prompt: None,
+            workers: HashMap::new(),
+            coordinator_vector_stores: Vec::new(),
+            allow_direct_answers: true,
+            allow_clarification: true,
+            tools_in_planning: ToolVisibility::default(),
+            max_tools_per_worker: default_max_tools_per_worker(),
+            duplicate_call_nudge_threshold: default_duplicate_call_nudge_threshold(),
+            duplicate_call_block_threshold: default_duplicate_call_block_threshold(),
+            timeouts: TimeoutsConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+        }
+    }
+}
+
+/// Intermediate struct for backward-compatible deserialization.
+#[derive(Deserialize)]
+struct RawOrchestrationConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_max_planning_cycles")]
+    max_planning_cycles: usize,
+    #[serde(default = "default_max_plan_parse_retries")]
+    max_plan_parse_retries: usize,
+    #[serde(default)]
+    worker_system_prompt: Option<String>,
+    #[serde(default, rename = "worker")]
+    workers: HashMap<String, WorkerConfig>,
+    #[serde(default)]
+    coordinator_vector_stores: Vec<String>,
+    #[serde(default = "default_true")]
+    allow_direct_answers: bool,
+    #[serde(default = "default_true")]
+    allow_clarification: bool,
+    #[serde(default)]
+    tools_in_planning: ToolVisibility,
+    #[serde(default = "default_max_tools_per_worker")]
+    max_tools_per_worker: usize,
+    #[serde(default = "default_duplicate_call_nudge_threshold")]
+    duplicate_call_nudge_threshold: usize,
+    #[serde(default = "default_duplicate_call_block_threshold")]
+    duplicate_call_block_threshold: usize,
+    // Sub-tables
+    #[serde(default)]
+    timeouts: Option<TimeoutsConfig>,
+    #[serde(default)]
+    artifacts: Option<ArtifactsConfig>,
+    // Flat artifact fields (backward compat)
+    #[serde(default, alias = "memory_path")]
+    memory_dir: Option<String>,
+    #[serde(default)]
+    result_artifact_threshold: Option<usize>,
+    #[serde(default)]
+    result_summary_length: Option<usize>,
+    #[serde(default)]
+    session_history_turns: Option<usize>,
+    #[serde(default)]
+    persistence_drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    tool_output_artifact_threshold: Option<usize>,
+    #[serde(default)]
+    tool_output_duration_threshold_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for OrchestrationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawOrchestrationConfig::deserialize(deserializer)?;
+
+        let timeouts = raw.timeouts.unwrap_or_default();
+
+        let mut artifacts = raw.artifacts.unwrap_or_default();
+        if let Some(v) = raw.memory_dir {
+            artifacts.memory_dir = Some(v);
+        }
+        if let Some(v) = raw.result_artifact_threshold {
+            artifacts.result_artifact_threshold = v;
+        }
+        if let Some(v) = raw.result_summary_length {
+            artifacts.result_summary_length = v;
+        }
+        if let Some(v) = raw.session_history_turns {
+            artifacts.session_history_turns = v;
+        }
+        if let Some(v) = raw.persistence_drain_timeout_ms {
+            artifacts.persistence_drain_timeout_ms = v;
+        }
+        if let Some(v) = raw.tool_output_artifact_threshold {
+            artifacts.tool_output_artifact_threshold = v;
+        }
+        if let Some(v) = raw.tool_output_duration_threshold_ms {
+            artifacts.tool_output_duration_threshold_ms = v;
+        }
+
+        Ok(OrchestrationConfig {
+            enabled: raw.enabled,
+            max_planning_cycles: raw.max_planning_cycles,
+            max_plan_parse_retries: raw.max_plan_parse_retries,
+            worker_system_prompt: raw.worker_system_prompt,
+            workers: raw.workers,
+            coordinator_vector_stores: raw.coordinator_vector_stores,
+            allow_direct_answers: raw.allow_direct_answers,
+            allow_clarification: raw.allow_clarification,
+            tools_in_planning: raw.tools_in_planning,
+            max_tools_per_worker: raw.max_tools_per_worker,
+            duplicate_call_nudge_threshold: raw.duplicate_call_nudge_threshold,
+            duplicate_call_block_threshold: raw.duplicate_call_block_threshold,
+            timeouts,
+            artifacts,
+        })
+    }
+}
+
+/// Tool visibility in planning prompts: none, summary (names only), or full (with descriptions).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolVisibility {
+    None,
+    #[default]
+    Summary,
+    Full,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_planning_cycles() -> usize {
+    3
+}
+
+fn default_max_tools_per_worker() -> usize {
+    10
+}
+
+fn default_per_call_timeout_secs() -> u64 {
+    0
+}
+
+fn default_max_plan_parse_retries() -> usize {
+    3
+}
+
+fn default_duplicate_call_nudge_threshold() -> usize {
+    3
+}
+
+fn default_duplicate_call_block_threshold() -> usize {
+    5
+}
+
+fn default_result_artifact_threshold() -> usize {
+    4000
+}
+
+fn default_result_summary_length() -> usize {
+    2000
 }
 
 impl Config {
@@ -29,128 +320,9 @@ impl Config {
     ///
     /// This is only supported for Ollama models.
     pub fn is_fallback_tool_parsing_enabled(&self) -> bool {
-        self.llm.is_fallback_tool_parsing_enabled()
+        self.agent.llm.is_fallback_tool_parsing_enabled()
     }
 }
-
-/// LLM provider configuration with strong typing per provider
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "provider", rename_all = "lowercase")]
-pub enum LlmConfig {
-    OpenAI {
-        api_key: String,
-        model: String,
-        #[serde(default)]
-        base_url: Option<String>,
-    },
-    Anthropic {
-        api_key: String,
-        model: String,
-        #[serde(default)]
-        base_url: Option<String>,
-    },
-    Bedrock {
-        model: String,
-        region: String,
-        /// AWS profile name (optional, uses default credentials if not specified)
-        #[serde(default)]
-        profile: Option<String>,
-    },
-    Gemini {
-        api_key: String,
-        model: String,
-        #[serde(default)]
-        base_url: Option<String>,
-    },
-    Ollama {
-        model: String,
-        #[serde(default = "default_ollama_base_url")]
-        base_url: String,
-        /// Enable fallback tool call parsing from text content.
-        /// Some Ollama models output tool calls as JSON text instead of proper tool_call structures.
-        /// When enabled, the system will attempt to parse tool calls from text responses.
-        /// Default: false
-        #[serde(default)]
-        fallback_tool_parsing: bool,
-        /// Context window size (number of tokens). Maps to Ollama's `num_ctx` option.
-        /// Default: None (uses Ollama's default, typically 2048)
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        num_ctx: Option<u32>,
-        /// Maximum number of tokens to predict. Maps to Ollama's `num_predict` option.
-        /// Default: None (uses Ollama's default, typically 128)
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        num_predict: Option<u32>,
-        /// Additional Ollama-specific parameters passed directly to the API.
-        /// Examples: seed, top_k, top_p, mirostat, etc.
-        /// See: https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values
-        #[serde(default)]
-        additional_params: Option<HashMap<String, serde_json::Value>>,
-    },
-}
-
-fn default_ollama_base_url() -> String {
-    "http://localhost:11434".to_string()
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        LlmConfig::OpenAI {
-            api_key: String::new(),
-            model: "gpt-4o".to_string(),
-            base_url: None,
-        }
-    }
-}
-
-impl LlmConfig {
-    /// Check if fallback tool parsing is enabled.
-    ///
-    /// This is only supported for Ollama models.
-    pub fn is_fallback_tool_parsing_enabled(&self) -> bool {
-        matches!(
-            self,
-            LlmConfig::Ollama {
-                fallback_tool_parsing: true,
-                ..
-            }
-        )
-    }
-
-    /// Get LLM's model name
-    pub fn model_info(&self) -> (&str, &str) {
-        match self {
-            LlmConfig::OpenAI {
-                api_key: _,
-                model,
-                base_url: _,
-            } => ("openai", model),
-            LlmConfig::Anthropic {
-                api_key: _,
-                model,
-                base_url: _,
-            } => ("anthropic", model),
-            LlmConfig::Bedrock {
-                model,
-                region: _,
-                profile: _,
-            } => ("bedrock", model),
-            LlmConfig::Gemini {
-                api_key: _,
-                model,
-                base_url: _,
-            } => ("gemini", model),
-            LlmConfig::Ollama {
-                model,
-                base_url: _,
-                fallback_tool_parsing: _,
-                num_ctx: _,
-                num_predict: _,
-                additional_params: _,
-            } => ("ollama", model),
-        }
-    }
-}
-
 /// MCP servers configuration
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct McpConfig {
@@ -177,6 +349,9 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
+        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -187,6 +362,9 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
 }
 
@@ -289,6 +467,7 @@ pub struct ToolsConfig {
 
 /// Agent configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
     #[serde(default)]
@@ -296,20 +475,10 @@ pub struct AgentConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub context: Vec<String>,
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
-    pub max_tokens: Option<u64>,
-    #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
     /// Maximum depth of tool calls per turn (default: 5, set to 0 to disable)
     #[serde(default = "default_turn_depth")]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
-    /// Context window size in tokens for this agent. Used for usage percentage
-    /// reporting in streaming events (aura.session_info).
-    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-    pub context_window: Option<u32>,
     /// Creation timestamp in milliseconds since epoch (defaults to current time)
     #[serde(default = "default_created_at")]
     pub created_at: u64,
@@ -317,6 +486,32 @@ pub struct AgentConfig {
     /// When omitted, defaults to the underlying LLM provider (e.g. "openai", "anthropic").
     #[serde(default)]
     pub model_owner: Option<String>,
+    /// Glob patterns for filtering which MCP tools to include.
+    /// When set, only tools matching at least one pattern are added.
+    /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
+    #[serde(default)]
+    pub mcp_filter: Option<Vec<String>>,
+    /// Whether this agent (single-agent or orchestration coordinator) may
+    /// invoke client-side tools advertised on the request. When false
+    /// (default), client tools are not attached even if the request
+    /// supplied them.
+    #[serde(default)]
+    pub enable_client_tools: bool,
+    /// Glob patterns selecting which client-side tools this agent can call.
+    /// `None` or empty means all client tools are available when
+    /// `enable_client_tools = true`.
+    #[serde(default)]
+    pub client_tool_filter: Option<Vec<String>>,
+    /// LLM configuration for this agent.
+    ///
+    /// Parsed from the `[agent.llm]` TOML table. Workers inherit this config
+    /// when no `[orchestration.worker.<name>.llm]` is provided.
+    #[serde(default)]
+    pub llm: LlmConfig,
+    /// Agent-level scratchpad config. Workers inherit this unless they
+    /// provide `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -337,13 +532,14 @@ impl Default for AgentConfig {
             alias: None,
             system_prompt: "You are a helpful assistant.".to_string(),
             context: Vec::new(),
-            temperature: Some(0.7),
-            reasoning_effort: None,
-            max_tokens: None,
             turn_depth: default_turn_depth(),
-            context_window: None,
             created_at: default_created_at(),
             model_owner: None,
+            mcp_filter: None,
+            enable_client_tools: false,
+            client_tool_filter: None,
+            llm: LlmConfig::default(),
+            scratchpad: None,
         }
     }
 }
@@ -356,24 +552,31 @@ impl Config {
         Ok(config)
     }
 
+    /// Get provider name and model for response formatting.
+    pub fn get_provider_info(&self) -> (&str, &str) {
+        match &self.agent.llm {
+            LlmConfig::OpenAI { model, .. } => ("openai", model),
+            LlmConfig::Anthropic { model, .. } => ("anthropic", model),
+            LlmConfig::Bedrock { model, .. } => ("bedrock", model),
+            LlmConfig::Gemini { model, .. } => ("gemini", model),
+            LlmConfig::Ollama { model, .. } => ("ollama", model),
+        }
+    }
+
+    /// Check if orchestration mode is enabled.
+    pub fn orchestration_enabled(&self) -> bool {
+        self.orchestration.as_ref().is_some_and(|o| o.enabled)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
-        // Basic validation - check API key for OpenAI/Anthropic, skip for Bedrock
-        match &self.llm {
-            LlmConfig::OpenAI { api_key, .. }
-            | LlmConfig::Anthropic { api_key, .. }
-            | LlmConfig::Gemini { api_key, .. } => {
-                if api_key.is_empty() {
-                    return Err(crate::ConfigError::Validation(
-                        "LLM API key is required".to_string(),
-                    ));
+        validate_llm_api_key(&self.agent.llm, "agent.llm")?;
+
+        if let Some(orch) = &self.orchestration {
+            for (name, worker) in &orch.workers {
+                if let Some(worker_llm) = &worker.llm {
+                    validate_llm_api_key(worker_llm, &format!("orchestration.worker.{name}.llm"))?;
                 }
-            }
-            LlmConfig::Bedrock { .. } => {
-                // Bedrock uses AWS credentials, no API key needed
-            }
-            LlmConfig::Ollama { .. } => {
-                // Ollama runs locally, no API key needed
             }
         }
 
@@ -407,6 +610,79 @@ impl Config {
             }
         }
 
+        // Scratchpad validation
+        self.validate_scratchpad()?;
+
         Ok(())
     }
+
+    /// When scratchpad is enabled on the agent or any worker, require a
+    /// `memory_dir` (top-level, with legacy fallback to
+    /// `[orchestration.artifacts].memory_dir`) and a `context_window` on each
+    /// scratchpad-enabled agent's effective LLM.
+    fn validate_scratchpad(&self) -> Result<(), crate::ConfigError> {
+        let agent_sp_enabled = self.agent.scratchpad.as_ref().is_some_and(|sp| sp.enabled);
+        let orch = self.orchestration.as_ref().filter(|o| o.enabled);
+
+        let worker_sp_enabled = |w: &WorkerConfig| {
+            w.scratchpad
+                .as_ref()
+                .map(|sp| sp.enabled)
+                .unwrap_or(agent_sp_enabled)
+        };
+        let any_worker_enabled = orch
+            .map(|o| o.workers.values().any(worker_sp_enabled))
+            .unwrap_or(false);
+
+        if !agent_sp_enabled && !any_worker_enabled {
+            return Ok(());
+        }
+
+        let effective_memory_dir = self.memory_dir.as_deref().or_else(|| {
+            self.orchestration
+                .as_ref()
+                .and_then(|o| o.artifacts.memory_dir.as_deref())
+        });
+        if effective_memory_dir.is_none() {
+            return Err(crate::ConfigError::Validation(
+                "Scratchpad enabled but top-level `memory_dir` is not set".to_string(),
+            ));
+        }
+
+        if agent_sp_enabled && self.agent.llm.context_window().is_none() {
+            return Err(crate::ConfigError::Validation(
+                "Scratchpad enabled but [agent.llm].context_window is not set".to_string(),
+            ));
+        }
+        if let Some(o) = orch {
+            for (name, worker) in &o.workers {
+                if worker_sp_enabled(worker) {
+                    let effective_llm = worker.llm.as_ref().unwrap_or(&self.agent.llm);
+                    if effective_llm.context_window().is_none() {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Scratchpad enabled for worker '{name}' but its effective LLM has no context_window"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
+    match llm {
+        LlmConfig::OpenAI { api_key, .. }
+        | LlmConfig::Anthropic { api_key, .. }
+        | LlmConfig::Gemini { api_key, .. } => {
+            if api_key.is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "LLM API key is required for [{location}]"
+                )));
+            }
+        }
+        LlmConfig::Bedrock { .. } | LlmConfig::Ollama { .. } => {}
+    }
+    Ok(())
 }

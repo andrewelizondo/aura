@@ -1,13 +1,22 @@
-use actix_web::{App, HttpResponse, HttpServer, middleware, web};
 use aura_config::load_config;
+use axum::Json;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::{
+    Router, middleware,
+    routing::{get, post},
+};
 use clap::Parser;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-mod handlers;
-mod streaming;
-mod types;
+use aura_web_server::handlers;
+use aura_web_server::streaming;
+use aura_web_server::types;
 
 use streaming::ToolResultMode;
 use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
@@ -45,7 +54,7 @@ struct Args {
 
     /// Maximum length for tool results in streaming (0 = no truncation)
     /// Results exceeding this will be truncated with "... [truncated]" suffix
-    #[arg(long, env = "TOOL_RESULT_MAX_LENGTH", default_value = "100")]
+    #[arg(long, env = "TOOL_RESULT_MAX_LENGTH", default_value = "1000")]
     tool_result_max_length: usize,
 
     /// Streaming buffer size - number of chunks to buffer before backpressure
@@ -54,13 +63,27 @@ struct Args {
     streaming_buffer_size: usize,
 
     /// Enable Aura custom SSE events (aura.tool_requested, aura.tool_start, aura.tool_complete, etc.)
-    /// These are emitted alongside OpenAI-compatible chunks for enhanced client UX
-    #[arg(long, env = "AURA_CUSTOM_EVENTS", default_value = "false", action = clap::ArgAction::Set)]
+    /// These are emitted alongside OpenAI-compatible chunks for enhanced client UX.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_CUSTOM_EVENTS",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     aura_custom_events: bool,
 
-    /// Enable reasoning event emission (aura.reasoning)
-    /// Only effective when aura_custom_events is also enabled
-    #[arg(long, env = "AURA_EMIT_REASONING", default_value = "false", action = clap::ArgAction::Set)]
+    /// Enable reasoning event emission (aura.reasoning).
+    /// Only effective when aura_custom_events is also enabled.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_EMIT_REASONING",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     aura_emit_reasoning: bool,
 
     /// SSE streaming request timeout in seconds.
@@ -74,8 +97,9 @@ struct Args {
     /// Maximum time to wait for the first chunk from the LLM provider before
     /// treating the connection as hung. Protects against non-streaming error
     /// responses that leave the connection open. Set to 0 to disable.
-    /// Default: 30 seconds (much shorter than the full streaming timeout).
-    #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "30")]
+    /// Default: 90 seconds. Allows for slower providers (Gemini, local
+    /// models) and extended-thinking warm-up time.
+    #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "90")]
     first_chunk_timeout_secs: u64,
 
     /// Graceful shutdown timeout in seconds.
@@ -93,25 +117,26 @@ struct Args {
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
 async fn shutdown_guard(
-    data: web::Data<AppState>,
-    req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
-) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
-    if data.shutdown_token.is_cancelled() {
-        let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "Server is shutting down".to_string(),
-                error_type: "service_unavailable".to_string(),
-            },
-        });
-        return Ok(req.into_response(response).map_into_right_body());
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.shutdown_token.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    message: "Server is shutting down".to_string(),
+                    error_type: "service_unavailable".to_string(),
+                },
+            }),
+        )
+            .into_response();
     }
-    next.call(req)
-        .await
-        .map(actix_web::dev::ServiceResponse::map_into_left_body)
+    next.run(request).await
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     let result = run().await;
     aura::logging::shutdown_tracer().await;
@@ -140,7 +165,7 @@ async fn run() -> std::io::Result<()> {
 
     for config in &configs {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
-        let (provider, model) = config.llm.model_info();
+        let (provider, model) = config.agent.llm.model_info();
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
     }
 
@@ -174,8 +199,7 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
-    // Create app state
-    let app_state = web::Data::new(AppState {
+    let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
@@ -188,6 +212,7 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        additional_tools: Arc::new(Vec::new),
     });
 
     info!(
@@ -195,28 +220,23 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
-    // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(app_state.clone())
-            .wrap(middleware::from_fn(shutdown_guard))
-            .wrap(middleware::Logger::default())
-            .route("/health", web::get().to(handlers::health))
-            .route("/v1/models", web::get().to(handlers::list_models))
-            .route(
-                "/v1/chat/completions",
-                web::post().to(handlers::chat_completions),
-            )
-    })
-    .bind((args.host.as_str(), args.port))?
-    .disable_signals()
-    // Buffer for Phase 2 cleanup ([DONE] send + MCP cancellation) after grace period
-    .shutdown_timeout(10)
-    .run();
+    let app = Router::new()
+        .route("/health", get(handlers::health))
+        .route("/v1/models", get(handlers::list_models))
+        .route("/v1/chat/completions", post(handlers::chat_completions))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            shutdown_guard,
+        ))
+        .with_state(app_state);
+
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    let server_handle = server.handle();
     tokio::spawn({
         let shutdown_token = shutdown_token.clone();
         let stream_shutdown_token = stream_shutdown_token.clone();
@@ -250,9 +270,13 @@ async fn run() -> std::io::Result<()> {
             // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
             stream_shutdown_token.cancel();
 
-            server_handle.stop(true).await;
+            let _ = shutdown_tx.send(());
         }
     });
 
-    server.await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            shutdown_rx.await.ok();
+        })
+        .await
 }

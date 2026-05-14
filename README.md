@@ -1,31 +1,24 @@
-# AURA
+# Aura
 
-AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
+A production-ready framework for composing AI agents and multi-agent workflows from declarative TOML configuration, with MCP tool integration, RAG pipelines, and an OpenAI-compatible web API. Built on [Rig.rs](https://github.com/0xPlaygrounds/rig) with reliability and operability enhancements.
 
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
 - Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
-- RAG pipeline integration with in-memory, Qdrant, and AWS Bedrock Knowledge Base vector stores, using OpenAI or AWS Bedrock embeddings
-- Embeddable Rust core, independent from configuration layer
+- RAG pipeline integration with in-memory and external vector stores
+- Embeddable Rust core independent from configuration layer
+- Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
+- Dependency-aware multi-wave execution with iterative re-planning loops
 
-> **Looking for orchestration mode?** Multi-agent orchestration is available
-> on the
-> [`feature/orchestration-mode`](https://github.com/mezmo/aura/tree/feature/orchestration-mode)
-> branch and is currently in **open alpha** — APIs, behavior, and configuration
-> are changing rapidly as we iterate.
->
-> The `main` branch is AURA's **production-ready single-agent framework**:
-> declarative TOML-driven agents with MCP tool integration, RAG pipelines,
-> multi-provider LLM support, and an OpenAI-compatible streaming API.
->
-> [Issues and feature requests](https://github.com/mezmo/aura/issues)
-> are welcome — we'd love your feedback on both.
+> **Open Alpha** — Aura is under active development. APIs and configuration
+> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
+> are welcome — we'd love your feedback.
 
 ## Table of Contents
 
-- [AURA](#aura)
+- [Aura](#aura)
   - [Table of Contents](#table-of-contents)
   - [Project Structure](#project-structure)
   - [Quick Start](./examples/quickstart/README.md)
@@ -33,6 +26,11 @@ Key capabilities:
   - [Usage](#usage)
     - [Web API Server](#web-api-server)
   - [Configuration](#configuration)
+    - [Multiple Agents](#multiple-agents)
+    - [Configuration Sections](#configuration-sections)
+    - [Orchestration](#orchestration)
+      - [Orchestration fields](#orchestration-fields)
+      - [Worker fields (`[orchestration.worker.<name>]`)](#worker-fields-orchestrationworkername)
     - [Ollama](#ollama)
     - [Observability](#observability)
   - [Docker Deployment](#docker-deployment)
@@ -47,36 +45,38 @@ Key capabilities:
 ```text
 aura/
 ├── crates/
-│   ├── aura/                # Core agent builder library
+│   ├── aura/                # Core library (agent builder + orchestration)
 │   ├── aura-config/         # TOML parser and config loader
 │   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 │   └── aura-test-utils/     # Shared testing utilities
-├── compose/                 # Docker Compose files for integration testing
-├── examples/                # Example configuration files
+├── compose/                 # Docker Compose (integration + orchestration overlays)
+├── configs/                 # E2E test and orchestration configurations
+├── deployment/              # Helm charts and K8s manifests
 ├── development/             # LibreChat and OpenWebUI setup
 ├── docs/                    # Architecture and protocol documentation
+├── examples/                # Example and reference configurations
 └── scripts/                 # CI and utility scripts
 ```
 
 ## Setup
 
 1. Install Rust if needed:
-  ```bash
+   ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  ```
+   ```
 2. Clone and configure:
-  ```bash
+   ```bash
    cd aura
    cp examples/reference.toml config.toml
-  ```
+   ```
 3. Set required environment variables:
-  ```bash
+   ```bash
    export OPENAI_API_KEY="your-api-key"
-  ```
+   ```
 4. Build:
-  ```bash
+   ```bash
    cargo build --release
-  ```
+   ```
 
 Security: keep secrets in environment variables and reference them in TOML using `{{ env.VAR_NAME }}`.
 
@@ -99,7 +99,7 @@ CONFIG_PATH=configs/ cargo run --bin aura-web-server
 # Host/port override
 HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
 
-# Enable AURA custom SSE events
+# Enable Aura custom SSE events
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 ```
 
@@ -116,7 +116,7 @@ Core server options:
 | `--aura-custom-events`       | `AURA_CUSTOM_EVENTS`       | `false`       | Enable `aura.*` events              |
 | `--aura-emit-reasoning`      | `AURA_EMIT_REASONING`      | `false`       | Enable `aura.reasoning`             |
 | `--tool-result-mode`         | `TOOL_RESULT_MODE`         | `none`        | Tool result streaming: none, open-web-ui, aura |
-| `--tool-result-max-length`   | `TOOL_RESULT_MAX_LENGTH`   | `100`         | Max chars before truncation (aura events) |
+| `--tool-result-max-length`   | `TOOL_RESULT_MAX_LENGTH`   | `1000`        | Max chars before truncation (aura events) |
 | `--shutdown-timeout-secs`    | `SHUTDOWN_TIMEOUT_SECS`    | `30`          | Graceful shutdown window            |
 
 Tool result modes:
@@ -154,9 +154,87 @@ SSE protocol details, event types, custom events, and client handling are docume
 
 For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
 
+### Client-Side Tools
+
+> ---
+> # **USE AT YOUR OWN RISK**
+> ---
+>
+> **Setting `enable_client_tools = true` on an agent grants the LLM the ability to call tools that execute on the *client's* machine.** When clients (e.g. `aura-cli`) advertise tools like `Shell`, `Read`, or `Update`, the LLM can invoke them and the client will execute them with the privileges of the user running the client. This is functionally equivalent to giving the model a shell prompt on every connecting client.
+>
+> **The risks are real:**
+> - **Prompt injection.** Anything the model reads — a file, an MCP tool output, a vector-store hit, a URL — can contain instructions that hijack the model into running destructive commands. The server cannot tell a legitimate request from an injected one.
+> - **Hallucination.** The model can confidently call the wrong tool with the wrong arguments. There is no undo for a `Shell("rm -rf ...")` invocation.
+> - **No server-side sandbox.** The server only forwards tool calls; execution happens client-side with full host privileges. Whatever sandboxing exists is the client's responsibility.
+> - **Per-agent permission filters reduce blast radius but are not a security boundary.** `client_tool_filter` controls which tools the model *can ask for*, not what they do once invoked.
+>
+> **Only enable on agents where:**
+> - You trust the model, the provider, and every data source the model can read (configs, MCP servers, vector stores, web fetches).
+> - You trust every client that will connect with `--enable-client-tools` and the user account it runs under.
+> - You and your users accept that worst-case loss (deleted files, leaked credentials, modified source) is acceptable or recoverable.
+>
+> Disabled by default. Opting an agent in is your decision and your responsibility — and your users'.
+>
+> See [aura-cli's matching warning](crates/aura-cli/README.md#client-side-tools) for the client-side perspective.
+
+> **Single-agent configurations only.** Client-side tools are not supported in orchestrated (multi-agent) configurations — when `[orchestration].enabled = true`, any `tools` array on the request is dropped with a warning. The reason: the passthrough mechanism requires terminating the user-facing SSE stream with `finish_reason: "tool_calls"`, which doesn't compose with the coordinator/worker pipeline. If you need local tools, use a single-agent config.
+
+The server honors a `tools` array on incoming chat completion requests. Whether those tools are actually attached to the LLM is a **per-agent opt-in** in TOML — there is no server-wide flag. Tools that get attached are registered as **passthrough** tools: the LLM sees them alongside any server-side MCP tools and can call them, but instead of executing server-side, the stream terminates with `finish_reason: "tool_calls"` so the client can run the tool locally and submit the result back as a `role: "tool"` follow-up.
+
+```toml
+[agent]
+name = "Assistant"
+system_prompt = "..."
+enable_client_tools = true
+client_tool_filter = ["Read", "ListFiles", "Find*"]   # optional; omitted/empty = all
+```
+
+`client_tool_filter` is a list of glob patterns matched against the request's `tools[].function.name`. An empty or omitted filter means all client tools are available. A request that supplies tools never reaches an agent that did not opt in.
+
+```bash
+# 1) Initial request advertising a client-side tool
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": true,
+    "messages": [{"role": "user", "content": "What time is it?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }]
+  }'
+
+# 2) Stream ends with finish_reason: "tool_calls". The client executes the tool
+#    locally and submits the result back in a follow-up request:
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": true,
+    "tools": [ ... same tools array ... ],
+    "messages": [
+      {"role": "user", "content": "What time is it?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_abc", "type": "function",
+         "function": {"name": "get_current_time", "arguments": "{}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call_abc", "content": "2026-04-30T14:30:00Z"}
+    ]
+  }'
+```
+
+When the loaded agent doesn't opt in (the default), any `tools` field on the request is silently dropped; the server runs MCP tools as usual but never asks the client to execute anything. Per-agent opt-in is the design — accepting client-supplied tool definitions means trusting the client to execute them, so it should be a deliberate config decision. See [aura-cli](crates/aura-cli/README.md#client-side-tools) for the matching client-side flag (`--enable-client-tools`) and how the two halves coordinate.
+
 ## Configuration
 
-`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, AURA loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
+> **Breaking changes (21 April 2026)**: `[llm]` has moved under `[agent.llm]` and workers may now override the LLM via `[orchestration.worker.<name>.llm]`. See [./docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md).
+>
+> **Breaking changes (10 April 2026)**: Several fields moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
+
+`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
 ### Multiple Agents
 
@@ -191,14 +269,12 @@ Aliases must be unique across all loaded configs. If two configs share the same 
 
 Configuration sections:
 
-- `[llm]`: provider and model configuration.
 - `[agent]`: identity, system prompt, and runtime behavior.
+- `[agent.llm]`: provider and model configuration for the agent.
 - `[[vector_stores]]`: optional RAG/vector store configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
-Supported LLM providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
-
-Supported vector stores: `in_memory`, `qdrant`, and `bedrock_kb` (AWS Bedrock Knowledge Bases — managed RAG, no embedding model required). For `in_memory` and `qdrant`, supported embedding providers are OpenAI and AWS Bedrock. See the `[[vector_stores]]` examples in [examples/reference.toml](examples/reference.toml).
+Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
 
 Supported MCP transports:
 
@@ -223,21 +299,22 @@ The complete starter configuration is in [examples/reference.toml](examples/refe
 Minimal example:
 
 ```toml
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.2"
-
-[mcp.servers.my_server]
-transport = "http_streamable"
-url = "http://localhost:8080/mcp"
-headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
-
 [agent]
 name = "Assistant"
 alias = "my-assistant"       # optional: stable client-facing identifier
 system_prompt = "You are a helpful assistant."
 turn_depth = 2
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+context_window = 128000
+
+[mcp.servers.my_server]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
 ```
 
 Validate config parsing quickly:
@@ -246,19 +323,142 @@ Validate config parsing quickly:
 cargo run -p aura-config --bin debug_config
 ```
 
+### Orchestration
+
+Enable orchestration mode in config:
+
+```toml
+# Top-level: shared by orchestration persistence and single-agent scratchpad
+memory_dir = "/tmp/orchestration-memory"
+
+[orchestration]
+enabled = true
+max_planning_cycles = 3
+tools_in_planning = "summary"
+allow_direct_answers = true
+allow_clarification = true
+
+[orchestration.worker.operations]
+description = "Operational analysis and diagnostics"
+preamble = "You are an operations specialist."
+mcp_filter = ["ops_*"]
+vector_stores = []
+
+[orchestration.worker.knowledge]
+description = "Documentation and procedures"
+preamble = "You are a knowledge specialist."
+mcp_filter = []
+vector_stores = ["docs"]
+```
+
+Each worker inherits `[agent.llm]` by default. To run a worker against a different model (cheaper, faster, bigger context, different provider), add a _complete_ LLM configuration at `[orchestration.worker.<name>.llm]` - this must be a complete LLM configuration not just the individual LLM fields you want to "override":
+
+```toml
+[orchestration.worker.formatting.llm]
+provider = "anthropic"
+api_key = "{{ env.ANTHROPIC_API_KEY }}"
+model = "claude-haiku-4-5-20251001"
+context_window = 200000
+```
+
+The worker's resolved `context_window` is what gets reported in per-worker `aura.session_info` events.
+
+Execution loop:
+
+- `Plan`: coordinator decomposes the request into a task DAG.
+- `Execute`: dependency-ready tasks run in parallel waves on worker agents.
+- `Continue`: coordinator consolidates worker outputs and routes to a final response, replan, or clarification.
+
+Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block.
+
+For a fuller multi-worker example, see [configs/example-math-orchestration.toml](configs/example-math-orchestration.toml).
+
+#### Orchestration fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable orchestration mode |
+| `max_planning_cycles` | int | `3` | Maximum plan→execute→continue iterations |
+| `allow_direct_answers` | bool | `true` | Allow coordinator to answer simple queries directly |
+| `allow_clarification` | bool | `true` | Allow coordinator to ask for clarification |
+| `tools_in_planning` | string | `"summary"` | Tool visibility for coordinator: `"none"`, `"summary"` (names only), `"full"` (with descriptions) |
+| `max_plan_parse_retries` | int | `3` | Retries if coordinator produces unparseable plan JSON |
+| `max_tools_per_worker` | int | `10` | Cap on MCP tools exposed to each worker |
+| `duplicate_call_nudge_threshold` | int | `3` | Consecutive identical tool calls before appending guidance annotation |
+| `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
+| `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
+| `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
+| `memory_dir` | string | — | **Legacy** — prefer top-level `memory_dir`. Directory for cross-iteration artifact persistence. Equivalent to `[orchestration.artifacts].memory_dir` |
+| `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
+| `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
+| `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
+
+#### Worker fields (`[orchestration.worker.<name>]`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `description` | string | *required* | Short description shown to coordinator during planning |
+| `preamble` | string | *required* | System prompt for this worker |
+| `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
+| `vector_stores` | list | `[]` | Named vector stores this worker has access to |
+| `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
+| `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
+| `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
+
+### Scratchpad (Context Window Management)
+
+Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
+
+Scratchpad works in both single-agent and orchestration modes. Configure at `[agent.scratchpad]` (applies to the single agent, or provides defaults for orchestration workers) and optionally override per worker at `[orchestration.worker.<name>.scratchpad]`. Set a top-level `memory_dir` for persistence:
+
+```toml
+# Top-level — required when scratchpad is enabled. Shared by single-agent
+# scratchpad and orchestration persistence.
+memory_dir = "/tmp/aura"
+
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20          # 20% of context reserved for reasoning/output
+max_extraction_tokens = 10_000        # cap per extraction tool call
+turn_depth_bonus = 6                  # extra ReAct turns when scratchpad is active
+
+[orchestration.worker.data-explorer.scratchpad]
+# Override just for this worker
+max_extraction_tokens = 5_000
+```
+
+**Storage location**:
+- Single-agent: `{memory_dir}/scratchpad/`
+- Orchestration: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/` (legacy `[orchestration.artifacts].memory_dir` still works as a fallback)
+
+Per-tool interception thresholds are configured at `[mcp.servers.<server>.scratchpad]`. Keys are **glob patterns** (default threshold `5_120` if omitted) that are matched against tool names at interception time:
+
+```toml
+[mcp.servers.k8s-sre.scratchpad]
+"*_list_*"                  = { min_tokens = 512 }   # broad
+"k8s_list_service_monitors" = { min_tokens = 384 }   # specific override
+"*"                         = { min_tokens = 4096 }  # catch-all
+```
+
+When multiple patterns match the same tool, the **longest (most specific) pattern wins**; on length ties the smallest threshold wins. Token counting uses real BPE tokenization via `tiktoken-rs` — not byte/character heuristics — so `min_tokens` reflects actual model token cost.
+
+**Per-call extraction limit (`max_extraction_tokens`, default 10_000):** every exploration tool checks the size of its result before returning. If a single call would exceed this cap (or the cumulative `ContextBudget`), the tool returns a structured JSON error like `{"error": "head_too_large", "estimated_tokens": ..., "suggestions": [...]}` instead of the content. The LLM sees this as a successful tool result and retries with smaller params — each retry consumes a turn, which is why `turn_depth_bonus` exists.
+
+Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
+
 ### Ollama
 
-AURA supports Ollama, including fallback tool-call parsing for model outputs that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
+Aura supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
 
 ### Observability
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes AURA traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Docker Deployment
 
-AURA includes containerized deployment assets at the repo root:
+Aura includes containerized deployment assets at the repo root:
 
 - `Dockerfile`: multi-stage build for the web server.
 - `docker-compose.yml`: local container deployment wiring.
@@ -270,6 +470,8 @@ docker compose up --build
 ```
 
 Default container port mapping is `3030:3030` in `docker-compose.yml`. Ensure your config path and API key environment variables are set for the container runtime.
+
+Orchestration testing overlays are available in `compose/` (for example `compose/orchestration.yml` and `compose/orchestration-test.yml`).
 
 ## Development and Testing
 
@@ -290,46 +492,75 @@ make build
 make build-release
 ```
 
+Test CI pipeline locally before pushing:
+
+```bash
+./scripts/test-ci.sh
+```
+
+The script mirrors Jenkins checks: format, workspace tests, and clippy with warnings denied.
+
 ## Testing
 
 Web server integration tests live under `crates/aura-web-server/tests/`.
 
-Run web server integration test workflow:
+Run integration workflows:
 
 ```bash
-./crates/aura-web-server/tests/run_tests.sh
+# Standard integration suites
+make test-integration
+
+# Local integration run against locally started test infra
+make test-integration-local
+
+# Orchestration-specific integration suites
+make test-integration-orchestration
+
+# Local orchestration integration run
+make test-integration-orchestration-local
+
+# SRE orchestration integration suites
+make test-integration-sre-orchestration
+
+# Local SRE orchestration integration run
+make test-integration-sre-orchestration-local
 ```
 
 Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 
 - Parent flag: `integration`
 - Suite flags: `integration-streaming`, `integration-header-forwarding`, `integration-mcp`, `integration-events`, `integration-cancellation`, `integration-progress`
+- Orchestration suite: `integration-orchestration` (separate from parent `integration`)
+- SRE orchestration suite: `integration-orchestration-sre` (requires k8s-sre-mcp server config)
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
-Detailed test guidance: [crates/aura-web-server/README.md#running-integration-tests](crates/aura-web-server/README.md#running-integration-tests).
+Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
 
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
+- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, and client examples.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
+- [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
 - [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
+- [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
+- [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
 ## Architecture
 
-AURA separates concerns across crates:
+Aura separates concerns across crates:
 
-- `aura`: runtime agent building, MCP integration, tool orchestration, and vector workflows.
+- `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.
 - `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
 
 This separation means:
 
-- **Embeddable core** - use `aura` directly in any Rust application without config file dependencies.
-- **Flexible config** - `aura-config` can be extended to support other formats (JSON, YAML).
-- **Testable boundaries** - each crate has focused responsibilities and clear interfaces.
+- Embeddable core: use `aura` directly in any Rust application without config file dependencies.
+- Flexible config: `aura-config` can be extended to support other formats (JSON, YAML).
+- Testable boundaries: each crate has focused responsibilities and clear interfaces.
 
 Key architectural characteristics:
 
@@ -337,6 +568,20 @@ Key architectural characteristics:
 - Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
 - Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.
 - Config-driven composition with embeddable Rust core.
+
+Prompt routing and execution model:
+
+- `build_streaming_agent()` routes requests based on `orchestration.enabled`.
+- Direct Mode (`orchestration.enabled = false`): single `Agent` handles the turn.
+- Orchestration Mode (`orchestration.enabled = true`): `Orchestrator` coordinates worker execution.
+- Both `Agent` and `Orchestrator` implement `StreamingAgent`, so they are interchangeable at the API boundary.
+
+Orchestrator components and loop:
+
+- Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
+- Worker agents: per-task instances with filtered MCP tools and vector stores.
+- Persistence/event layers: track plan state, task outcomes, and stream orchestration events.
+- Loop: Plan -> Execute (dependency waves) -> Continue (respond / replan / clarify).
 
 Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
 

@@ -160,7 +160,7 @@ fn merge_configs(base_config: Config, override_config: Config) -> Result<Config,
 
     // Override LLM config if provided - with enum, we replace the entire config
     // TODO: More granular overrides would require matching variants
-    result.llm = override_config.llm;
+    result.agent.llm = override_config.agent.llm;
 
     // Override MCP config if provided
     if override_config.mcp.is_some() {
@@ -189,9 +189,6 @@ fn merge_configs(base_config: Config, override_config: Config) -> Result<Config,
     }
     if !override_config.agent.context.is_empty() {
         result.agent.context = override_config.agent.context;
-    }
-    if override_config.agent.temperature.is_some() {
-        result.agent.temperature = override_config.agent.temperature;
     }
 
     Ok(result)
@@ -242,6 +239,7 @@ mod tests {
 
     #[test]
     fn test_standard_loader() {
+        let _env_lock = crate::test_env_lock::lock();
         // Set some test environment variables
         unsafe {
             std::env::set_var("RIG_LLM_PROVIDER", "test_provider");

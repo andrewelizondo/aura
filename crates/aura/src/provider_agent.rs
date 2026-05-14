@@ -14,10 +14,13 @@ use rig::agent::{AgentBuilder, AgentBuilderSimple, MultiTurnStreamItem};
 use rig::completion::{CompletionModel, Usage};
 use rig::message::ToolResultContent;
 use rig::streaming::{StreamingChat, StreamingPrompt};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::orchestration::OrchestratorEvent;
+use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
 
 // Type aliases for provider-specific completion models
@@ -153,12 +156,16 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let (hook, cancel_tx, usage_state) =
+            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {
@@ -230,6 +237,7 @@ impl ProviderAgent {
     /// - stream: The actual stream of completion items
     /// - cancel_sender: Send `true` to cancel the stream
     /// - usage_state: Shared state for reading final usage at stream end
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_with_timeout(
         &self,
         query: &str,
@@ -237,12 +245,16 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let (hook, cancel_tx, usage_state) =
+            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {
@@ -329,6 +341,26 @@ pub enum StreamItem {
     Final(FinalResponseInfo),
     /// Internal marker for final response (filtered out before returning to caller)
     FinalMarker,
+    /// Per-turn token usage from intermediate turns (not end-of-stream).
+    /// Emitted on every Rig `Final` chunk so callers can capture usage
+    /// even when they short-circuit before the terminal `FinalResponse`.
+    TurnUsage(Usage),
+    /// Orchestrator status event (plan progress, task status, etc.)
+    OrchestratorEvent(OrchestratorEvent),
+    /// Per-agent scratchpad usage report.
+    ///
+    /// Emitted after an agent (single-agent or orchestration worker) finishes
+    /// with scratchpad activity. The web server handler converts this to an
+    /// `aura.scratchpad_usage` SSE event, filling in correlation context from
+    /// the request.
+    ScratchpadUsage {
+        /// The agent that produced this usage (worker name, "main", etc.).
+        agent_id: String,
+        /// Tokens of raw tool output diverted to scratchpad.
+        tokens_intercepted: usize,
+        /// Tokens extracted from scratchpad back into context.
+        tokens_extracted: usize,
+    },
 }
 
 /// Final response information.
@@ -393,7 +425,7 @@ pub type StreamError = Box<dyn std::error::Error + Send + Sync>;
 /// This function handles the conversion from rig's generic streaming types
 /// to our provider-agnostic types. The generic parameter R is the provider's
 /// streaming response type, which we don't need to inspect.
-fn map_stream_item<R>(
+fn map_stream_item<R: rig::completion::GetTokenUsage>(
     item: Result<MultiTurnStreamItem<R>, impl std::error::Error + Send + Sync + 'static>,
 ) -> Result<StreamItem, StreamError> {
     use rig::streaming::{
@@ -425,10 +457,16 @@ fn map_stream_item<R>(
                         delta: reasoning,
                     }
                 }
-                RigAssistant::Final(_) => {
-                    // Final response marker - we don't need to forward this
-                    // as we handle FinalResponse separately
-                    return Ok(StreamItem::FinalMarker);
+                RigAssistant::Final(ref resp) => {
+                    // Per-turn usage — not end-of-stream. Callers that
+                    // short-circuit (e.g. stream_and_collect) can capture
+                    // token counts from this without waiting for FinalResponse.
+                    let usage = resp.token_usage().unwrap_or(Usage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                    });
+                    return Ok(StreamItem::TurnUsage(usage));
                 }
             };
             Ok(StreamItem::StreamAssistantItem(mapped))
@@ -505,6 +543,20 @@ where
             BuilderState::WithTools(builder) => {
                 BuilderState::WithTools(builder.rmcp_tools(tools, client))
             }
+        }
+    }
+
+    /// Add multiple dynamic tools to the agent builder.
+    ///
+    /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
+    /// tools from external crates that implement `rig::tool::Tool`.
+    pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
+        if tools.is_empty() {
+            return self;
+        }
+        match self {
+            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
+            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
         }
     }
 

@@ -2,11 +2,6 @@ use aura_config::load_config_from_str;
 
 const TEST_CONFIG: &str = r#"
 # Test configuration with environment variables set to test values
-[llm]
-provider = "openai"
-api_key = "test_openai_key"
-model = "gpt-4o-mini"
-
 [vector_store]
 type = "in_memory"
 
@@ -50,6 +45,11 @@ context = [
     "You can use tools to help answer questions.",
     "Be concise but thorough in your responses."
 ]
+
+[agent.llm]
+provider = "openai"
+api_key = "test_openai_key"
+model = "gpt-4o-mini"
 temperature = 0.7
 "#;
 
@@ -66,12 +66,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test specific parts
     println!("\n🔍 Specific sections:");
-    let (provider, model) = match &config.llm {
-        aura_config::config::LlmConfig::OpenAI { model, .. } => ("openai", model.as_str()),
-        aura_config::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.as_str()),
-        aura_config::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.as_str()),
-        aura_config::config::LlmConfig::Gemini { model, .. } => ("gemini", model.as_str()),
-        aura_config::config::LlmConfig::Ollama { model, .. } => ("ollama", model.as_str()),
+    let (provider, model) = match &config.agent.llm {
+        aura::config::LlmConfig::OpenAI { model, .. } => ("openai", model.as_str()),
+        aura::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.as_str()),
+        aura::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.as_str()),
+        aura::config::LlmConfig::Gemini { model, .. } => ("gemini", model.as_str()),
+        aura::config::LlmConfig::Ollama { model, .. } => ("ollama", model.as_str()),
     };
     println!("LLM Provider: {provider} ({model})");
 
@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     headers,
                     description,
                     headers_from_request,
+                    ..
                 } => {
                     println!(
                         "  - {}: HTTP Streamable at {} ({} headers)",
@@ -104,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args,
                     env,
                     description,
+                    ..
                 } => {
                     println!(
                         "  - {}: STDIO command {:?} with {} args, {} env vars",
@@ -129,10 +131,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!(
-        "Agent: {} (temp: {:?})",
-        config.agent.name, config.agent.temperature
-    );
     if !config.vector_stores.is_empty() {
         println!("Vector Stores: {} configured", config.vector_stores.len());
         for (i, store) in config.vector_stores.iter().enumerate() {

@@ -1,422 +1,57 @@
 //! Aura-specific SSE streaming events for enhanced client UX.
 //!
-//! Emitted alongside OpenAI-compatible chunks for tool execution observability.
-//! All events include `CorrelationContext` for Phoenix/OTEL trace correlation.
+//! Type definitions live in the [`aura_events`] crate (lightweight, no agent deps).
+//! This module re-exports them and adds the `from_current_span` constructor
+//! which depends on `tracing` (only available in the full aura crate).
 
-use rmcp::model::ProgressToken;
-use serde::Serialize;
+// Re-export everything from aura-events so existing consumers don't break
+pub use aura_events::{
+    AgentContext, AuraStreamEvent, CorrelationContext, NumberOrString, ProgressToken, WorkerPhase,
+    format_named_sse,
+};
 
-/// Context identifying which agent emitted an event.
+// Re-export orchestration event types
+pub use aura_events::orchestration;
+
+/// Extension trait for `CorrelationContext` that adds tracing integration.
 ///
-/// For single-agent deployments, use `AgentContext::single_agent()` which sets
-/// `agent_id: "main"`. For multi-agent orchestrators, populate `parent_agent_id`
-/// to establish the agent hierarchy.
-///
-/// Note: `AgentContext::default()` gives an empty `agent_id` - use `single_agent()`
-/// for the standard single-agent context.
-#[derive(Clone, Debug, Serialize, Default)]
-pub struct AgentContext {
-    /// Unique identifier for this agent (e.g., "main", "log_worker", "rca_worker")
-    pub agent_id: String,
-    /// Human-readable name for display (e.g., "Aura Agent", "Log Analysis Worker")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<String>,
-    /// Parent agent ID for hierarchical multi-agent setups
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_agent_id: Option<String>,
-}
-
-impl AgentContext {
-    /// Create a default single-agent context with agent_id = "main"
-    pub fn single_agent() -> Self {
-        Self {
-            agent_id: "main".to_string(),
-            agent_name: None,
-            parent_agent_id: None,
-        }
-    }
-
-    /// Create a single-agent context with a custom name
-    pub fn single_agent_with_name(name: impl Into<String>) -> Self {
-        Self {
-            agent_id: "main".to_string(),
-            agent_name: Some(name.into()),
-            parent_agent_id: None,
-        }
-    }
-
-    /// Create a worker agent context with parent hierarchy
-    pub fn worker(
-        id: impl Into<String>,
-        name: Option<String>,
-        parent_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            agent_id: id.into(),
-            agent_name: name,
-            parent_agent_id: Some(parent_id.into()),
-        }
-    }
-}
-
-/// Correlation context for OTEL/Phoenix tracing and session grouping.
-///
-/// All Aura events include this context to enable:
-/// - Session grouping: All events in a conversation share `session_id`
-/// - Trace correlation: Link SSE events to Phoenix/OTEL traces via `trace_id`
-#[derive(Clone, Debug, Serialize, Default)]
-pub struct CorrelationContext {
-    /// Chat session ID (from request handler or X-Chat-Session-Id header)
-    pub session_id: String,
-    /// OTEL trace ID (from tracing::Span) for Phoenix correlation
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace_id: Option<String>,
-}
-
-impl CorrelationContext {
+/// This is defined as a trait (not inherent impl) because `CorrelationContext`
+/// lives in the `aura-events` crate. Only available in the full `aura` crate.
+pub trait CorrelationContextExt {
     /// Create correlation context from the current tracing span.
     ///
     /// Captures the trace ID from `tracing::Span::current()` for OTEL correlation.
-    pub fn from_current_span(session_id: impl Into<String>) -> Self {
+    fn from_current_span(session_id: impl Into<String>) -> CorrelationContext;
+}
+
+impl CorrelationContextExt for CorrelationContext {
+    fn from_current_span(session_id: impl Into<String>) -> CorrelationContext {
         let trace_id = tracing::Span::current()
             .id()
             .map(|id| format!("{:x}", id.into_u64()));
-        Self {
-            session_id: session_id.into(),
-            trace_id,
-        }
-    }
-
-    /// Create correlation context with explicit values (for testing or custom setups)
-    pub fn new(session_id: impl Into<String>, trace_id: Option<String>) -> Self {
-        Self {
+        CorrelationContext {
             session_id: session_id.into(),
             trace_id,
         }
     }
 }
 
-/// Worker phase for multi-agent orchestration (future use).
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerPhase {
-    /// Worker is planning its approach
-    Planning,
-    /// Worker is executing tools
-    Executing,
-    /// Worker is analyzing results
-    Analyzing,
-}
-
-/// Aura-specific streaming events sent via SSE `event:` field.
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-pub enum AuraStreamEvent {
-    /// Emitted at stream start with model and context limit information.
-    /// UI can use this for context window percentage calculation.
-    SessionInfo {
-        /// The model name (e.g., "gpt-4o", "claude-3-opus")
-        model: String,
-        /// Context limit for this model (in tokens), if known
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_context_limit: Option<u32>,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted when the LLM decides to call a tool (immediate UI feedback).
-    /// This is sent as soon as we know a tool will be called, before MCP execution.
-    ToolRequested {
-        tool_id: String,
-        tool_name: String,
-        arguments: serde_json::Value,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted when MCP tool execution actually begins.
-    /// Contains progress_token for correlating with aura.progress events.
-    ToolStart {
-        tool_id: String,
-        tool_name: String,
-        /// Progress token for correlating with aura.progress events from MCP server
-        #[serde(skip_serializing_if = "Option::is_none")]
-        progress_token: Option<ProgressToken>,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted when a tool call completes (success or failure).
-    ToolComplete {
-        tool_id: String,
-        tool_name: String,
-        duration_ms: u64,
-        success: bool,
-        /// The actual tool result content (for success) or error message (for failure)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted for LLM reasoning content (Anthropic extended thinking).
-    Reasoning {
-        content: String,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted for initialization/discovery progress updates.
-    /// Contains progress_token for correlating with the aura.tool_start event.
-    Progress {
-        message: String,
-        phase: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        percent: Option<u8>,
-        /// Token linking this progress to the tool that generated it (from aura.tool_start)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        progress_token: Option<ProgressToken>,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted for multi-agent worker phase transitions (future).
-    WorkerPhase {
-        phase: WorkerPhase,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<String>,
-        #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted when usage information becomes available, associating tools with usage snapshot.
-    /// This is emitted from the `on_stream_completion_response_finish` hook.
-    ToolUsage {
-        /// Tool IDs completed since the last usage event
-        tool_ids: Vec<String>,
-        /// Prompt tokens (context size at this point)
-        prompt_tokens: u64,
-        /// Completion tokens generated
-        completion_tokens: u64,
-        /// Total tokens used
-        total_tokens: u64,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-    /// Emitted at stream end with final usage information.
-    /// UI uses `prompt_tokens` to calculate context window percentage:
-    /// `percentage = (prompt_tokens / model_context_limit) * 100`
-    Usage {
-        /// Prompt tokens (final context size for % calculation)
-        prompt_tokens: u64,
-        /// Completion tokens generated in final response
-        completion_tokens: u64,
-        /// Total tokens used
-        total_tokens: u64,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
-    },
-}
-
-impl AuraStreamEvent {
-    /// Get the SSE event name for this event type.
-    pub fn event_name(&self) -> &'static str {
-        match self {
-            Self::SessionInfo { .. } => "aura.session_info",
-            Self::ToolRequested { .. } => "aura.tool_requested",
-            Self::ToolStart { .. } => "aura.tool_start",
-            Self::ToolComplete { .. } => "aura.tool_complete",
-            Self::Reasoning { .. } => "aura.reasoning",
-            Self::Progress { .. } => "aura.progress",
-            Self::WorkerPhase { .. } => "aura.worker_phase",
-            Self::ToolUsage { .. } => "aura.tool_usage",
-            Self::Usage { .. } => "aura.usage",
-        }
-    }
-
-    /// Format this event as an SSE message with the event: field.
-    ///
-    /// Returns a string in the format:
-    /// ```text
-    /// event: aura.tool_start
-    /// data: {"tool_id":"...","tool_name":"..."}
-    ///
-    /// ```
-    pub fn format_sse(&self) -> String {
-        let event_name = self.event_name();
-        let data = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
-        format!("event: {event_name}\ndata: {data}\n\n")
-    }
-
-    /// Create a ToolRequested event (LLM decided to call a tool).
-    /// This provides immediate UI feedback before MCP execution begins.
-    pub fn tool_requested(
-        tool_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        arguments: serde_json::Value,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::ToolRequested {
-            tool_id: tool_id.into(),
-            tool_name: tool_name.into(),
-            arguments,
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a ToolStart event (MCP execution actually beginning).
-    /// This includes the progress_token for correlating with aura.progress events.
-    pub fn tool_start(
-        tool_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        progress_token: Option<ProgressToken>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::ToolStart {
-            tool_id: tool_id.into(),
-            tool_name: tool_name.into(),
-            progress_token,
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a ToolComplete event for successful execution.
-    pub fn tool_complete_success(
-        tool_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        duration_ms: u64,
-        result: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::ToolComplete {
-            tool_id: tool_id.into(),
-            tool_name: tool_name.into(),
-            duration_ms,
-            success: true,
-            result: Some(result.into()),
-            error: None,
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a ToolComplete event for failed execution.
-    pub fn tool_complete_failure(
-        tool_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        duration_ms: u64,
-        error: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::ToolComplete {
-            tool_id: tool_id.into(),
-            tool_name: tool_name.into(),
-            duration_ms,
-            success: false,
-            result: None,
-            error: Some(error.into()),
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a Reasoning event.
-    pub fn reasoning(
-        content: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::Reasoning {
-            content: content.into(),
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a Progress event with optional progress_token for tool correlation.
-    pub fn progress(
-        message: impl Into<String>,
-        phase: impl Into<String>,
-        percent: Option<u8>,
-        progress_token: Option<ProgressToken>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::Progress {
-            message: message.into(),
-            phase: phase.into(),
-            percent,
-            progress_token,
-            agent,
-            correlation,
-        }
-    }
-
-    /// Create a SessionInfo event (emitted at stream start).
-    ///
-    /// Contains model name and context limit for UI context window calculation.
-    pub fn session_info(
-        model: impl Into<String>,
-        model_context_limit: Option<u32>,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::SessionInfo {
-            model: model.into(),
-            model_context_limit,
-            correlation,
-        }
-    }
-
-    /// Create a ToolUsage event (emitted when usage becomes available).
-    ///
-    /// Associates tool_ids with their usage snapshot. This is called from
-    /// `on_stream_completion_response_finish` when the hook receives usage data.
-    pub fn tool_usage(
-        tool_ids: Vec<String>,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        total_tokens: u64,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::ToolUsage {
-            tool_ids,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            correlation,
-        }
-    }
-
-    /// Create a Usage event (emitted at stream end).
-    ///
-    /// Contains final usage for context window percentage calculation:
-    /// `percentage = (prompt_tokens / model_context_limit) * 100`
-    pub fn usage(
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        total_tokens: u64,
-        correlation: CorrelationContext,
-    ) -> Self {
-        Self::Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            correlation,
-        }
-    }
+/// Constants for SSE event names on the base `aura.*` namespace.
+///
+/// Import these in tests or downstream consumers instead of hard-coding the
+/// string literals. Orchestration-specific events live in
+/// `orchestration::stream_events::event_names` under `aura.orchestrator.*`.
+pub mod event_names {
+    pub const SESSION_INFO: &str = "aura.session_info";
+    pub const TOOL_REQUESTED: &str = "aura.tool_requested";
+    pub const TOOL_START: &str = "aura.tool_start";
+    pub const TOOL_COMPLETE: &str = "aura.tool_complete";
+    pub const REASONING: &str = "aura.reasoning";
+    pub const PROGRESS: &str = "aura.progress";
+    pub const WORKER_PHASE: &str = "aura.worker_phase";
+    pub const TOOL_USAGE: &str = "aura.tool_usage";
+    pub const USAGE: &str = "aura.usage";
+    pub const SCRATCHPAD_USAGE: &str = "aura.scratchpad_usage";
 }
 
 #[cfg(test)]
@@ -463,7 +98,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_requested");
+        assert_eq!(event.event_name(), event_names::TOOL_REQUESTED);
     }
 
     #[test]
@@ -475,7 +110,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_start");
+        assert_eq!(event.event_name(), event_names::TOOL_START);
     }
 
     #[test]
@@ -488,7 +123,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_complete");
+        assert_eq!(event.event_name(), event_names::TOOL_COMPLETE);
     }
 
     #[test]
@@ -498,7 +133,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.reasoning");
+        assert_eq!(event.event_name(), event_names::REASONING);
     }
 
     #[test]
@@ -511,7 +146,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_requested\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_REQUESTED)));
         assert!(sse.contains("data: "));
         assert!(sse.contains("\"tool_id\":\"call_abc123\""));
         assert!(sse.contains("\"tool_name\":\"list_pipelines\""));
@@ -532,7 +167,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_start\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_START)));
         assert!(sse.contains("data: "));
         assert!(sse.contains("\"tool_id\":\"call_abc123\""));
         assert!(sse.contains("\"tool_name\":\"list_pipelines\""));
@@ -553,7 +188,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_complete\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_COMPLETE)));
         assert!(sse.contains("\"duration_ms\":1234"));
         assert!(sse.contains("\"success\":true"));
         assert!(sse.contains("\"result\":\"Pipeline list result\""));
@@ -622,7 +257,7 @@ mod tests {
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.progress\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PROGRESS)));
         assert!(sse.contains("\"message\":\"Discovered 11 MCP tools\""));
         assert!(sse.contains("\"phase\":\"discovery\""));
         assert!(sse.contains("\"percent\":100"));
@@ -643,7 +278,7 @@ mod tests {
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.progress\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PROGRESS)));
         assert!(!sse.contains("progress_token")); // Should be omitted when None
     }
 
@@ -656,7 +291,7 @@ mod tests {
             correlation: CorrelationContext::default(),
         };
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.worker_phase\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::WORKER_PHASE)));
         assert!(sse.contains("\"phase\":\"executing\""));
         assert!(sse.contains("\"task_id\":\"task_1\""));
         assert!(sse.contains("\"parent_agent_id\":\"orchestrator\""));
@@ -670,7 +305,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.session_info\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SESSION_INFO)));
         assert!(sse.contains("\"model\":\"gpt-4o\""));
         assert!(sse.contains("\"model_context_limit\":128000"));
         assert!(sse.contains("\"session_id\":\"sess_xyz\""));
@@ -684,7 +319,7 @@ mod tests {
             CorrelationContext::new("sess_abc", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.session_info\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SESSION_INFO)));
         assert!(sse.contains("\"model\":\"unknown-model\""));
         assert!(!sse.contains("model_context_limit")); // Should be omitted when None
     }
@@ -699,7 +334,7 @@ mod tests {
             CorrelationContext::new("sess_123", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_usage\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_USAGE)));
         assert!(sse.contains("\"tool_ids\":[\"call_abc\",\"call_def\"]"));
         assert!(sse.contains("\"prompt_tokens\":18777"));
         assert!(sse.contains("\"completion_tokens\":500"));
@@ -716,7 +351,7 @@ mod tests {
             CorrelationContext::new("sess_final", Some("trace_xyz".to_string())),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.usage\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::USAGE)));
         assert!(sse.contains("\"prompt_tokens\":21500"));
         assert!(sse.contains("\"completion_tokens\":342"));
         assert!(sse.contains("\"total_tokens\":21842"));
@@ -728,13 +363,71 @@ mod tests {
     fn test_event_name_new_events() {
         let session_info =
             AuraStreamEvent::session_info("gpt-4", None, CorrelationContext::default());
-        assert_eq!(session_info.event_name(), "aura.session_info");
+        assert_eq!(session_info.event_name(), event_names::SESSION_INFO);
 
         let tool_usage =
             AuraStreamEvent::tool_usage(vec![], 0, 0, 0, CorrelationContext::default());
-        assert_eq!(tool_usage.event_name(), "aura.tool_usage");
+        assert_eq!(tool_usage.event_name(), event_names::TOOL_USAGE);
 
         let usage = AuraStreamEvent::usage(0, 0, 0, CorrelationContext::default());
-        assert_eq!(usage.event_name(), "aura.usage");
+        assert_eq!(usage.event_name(), event_names::USAGE);
+    }
+
+    #[test]
+    fn test_scratchpad_usage_event_name() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            15_840,
+            1_200,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        assert_eq!(event.event_name(), "aura.scratchpad_usage");
+    }
+
+    #[test]
+    fn test_scratchpad_usage_format_sse() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            15_840,
+            1_200,
+            AgentContext::worker("data-explorer", None, "orchestrator"),
+            CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
+        );
+        let sse = event.format_sse();
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SCRATCHPAD_USAGE)));
+        assert!(sse.contains("\"tokens_intercepted\":15840"));
+        assert!(sse.contains("\"tokens_extracted\":1200"));
+        assert!(sse.contains("\"agent_id\":\"data-explorer\""));
+        assert!(sse.contains("\"parent_agent_id\":\"orchestrator\""));
+        assert!(sse.contains("\"session_id\":\"sess_xyz\""));
+        assert!(sse.contains("\"trace_id\":\"trace_123\""));
+        // Event is agent-scoped, not task-scoped.
+        assert!(!sse.contains("task_id"));
+        assert!(sse.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_scratchpad_usage_single_agent_id_is_main() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            0,
+            0,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        let sse = event.format_sse();
+        assert!(sse.contains("\"agent_id\":\"main\""));
+        assert!(!sse.contains("parent_agent_id"));
+    }
+
+    #[test]
+    fn test_scratchpad_usage_zero_values_still_serialize() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            0,
+            0,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        let sse = event.format_sse();
+        assert!(sse.contains("\"tokens_intercepted\":0"));
+        assert!(sse.contains("\"tokens_extracted\":0"));
     }
 }
