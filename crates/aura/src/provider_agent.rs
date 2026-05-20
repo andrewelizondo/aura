@@ -26,6 +26,8 @@ use crate::streaming_request_hook::StreamingRequestHook;
 // Type aliases for provider-specific completion models
 pub type OpenAICompletionModel =
     rig::providers::openai::completion::CompletionModel<reqwest::Client>;
+pub type OpenAIResponsesCompletionModel =
+    rig::providers::openai::responses_api::ResponsesCompletionModel<reqwest::Client>;
 pub type AnthropicCompletionModel =
     rig::providers::anthropic::completion::CompletionModel<reqwest::Client>;
 pub type BedrockCompletionModel = rig_bedrock::completion::CompletionModel;
@@ -35,6 +37,7 @@ pub type GeminiCompletionModel =
 
 // Type aliases for provider-specific agents
 pub type OpenAIAgent = rig::agent::Agent<OpenAICompletionModel>;
+pub type OpenAIResponsesAgent = rig::agent::Agent<OpenAIResponsesCompletionModel>;
 pub type AnthropicAgent = rig::agent::Agent<AnthropicCompletionModel>;
 pub type BedrockAgent = rig::agent::Agent<BedrockCompletionModel>;
 pub type OllamaAgent = rig::agent::Agent<OllamaCompletionModel>;
@@ -47,6 +50,11 @@ pub type GeminiAgent = rig::agent::Agent<GeminiCompletionModel>;
 /// instead use the methods which delegate appropriately.
 pub(crate) enum ProviderAgent {
     OpenAI(OpenAIAgent),
+    /// OpenAI Responses API (`/v1/responses`) variant.
+    /// Uses `ResponsesCompletionModel`, which implements `CompletionModel` so it
+    /// plugs into `rig::agent::Agent` and the streaming pipeline identically to
+    /// the Chat Completions variant.
+    OpenAIResponses(OpenAIResponsesAgent),
     Anthropic(AnthropicAgent),
     Bedrock(BedrockAgent),
     Gemini(GeminiAgent),
@@ -58,6 +66,7 @@ impl ProviderAgent {
     pub fn provider_name(&self) -> &'static str {
         match self {
             Self::OpenAI(_) => "openai",
+            Self::OpenAIResponses(_) => "openai",
             Self::Anthropic(_) => "anthropic",
             Self::Bedrock(_) => "bedrock",
             Self::Gemini(_) => "gemini",
@@ -76,6 +85,10 @@ impl ProviderAgent {
     ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
         match self {
             Self::OpenAI(agent) => {
+                let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            Self::OpenAIResponses(agent) => {
                 let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
@@ -107,6 +120,13 @@ impl ProviderAgent {
     ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
         match self {
             Self::OpenAI(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .multi_turn(max_depth)
+                    .await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            Self::OpenAIResponses(agent) => {
                 let stream = agent
                     .stream_chat(query, chat_history)
                     .multi_turn(max_depth)
@@ -169,6 +189,18 @@ impl ProviderAgent {
 
         match self {
             Self::OpenAI(agent) => {
+                let stream = agent
+                    .stream_prompt(query)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::OpenAIResponses(agent) => {
                 let stream = agent
                     .stream_prompt(query)
                     .with_hook(hook)
@@ -258,6 +290,18 @@ impl ProviderAgent {
 
         match self {
             Self::OpenAI(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::OpenAIResponses(agent) => {
                 let stream = agent
                     .stream_chat(query, chat_history)
                     .with_hook(hook)

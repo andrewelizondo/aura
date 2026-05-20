@@ -68,6 +68,7 @@ aura/
 - TOML-based declarative configuration
 - Environment variable resolution (`{{ env.VAR }}`)
 - Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama)
+- OpenAI provider supports both `/v1/responses` (default, `api = "responses"`) and `/v1/chat/completions` (`api = "chat_completions"`). Set `api = "chat_completions"` for OpenAI-compatible services reached via a custom `base_url` that don't implement the Responses API.
 - Dynamic tool registration
 
 ### MCP Integration

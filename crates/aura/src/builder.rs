@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
+    config::{AgentConfig, LlmConfig, McpServerConfig, OpenAIApi, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
     passthrough_tool::PassthroughTool,
@@ -373,10 +373,12 @@ impl Agent {
                 reasoning_effort,
                 temperature,
                 additional_params,
+                api,
                 ..
             } => {
                 tracing::info!("Initializing OpenAI provider");
                 tracing::debug!("  Model: {}", model);
+                tracing::info!("  API: {}", api);
 
                 let mut client_builder =
                     rig::providers::openai::Client::<reqwest::Client>::builder().api_key(api_key);
@@ -389,19 +391,8 @@ impl Agent {
                 let client = client_builder.build()?;
                 tracing::info!("OpenAI client initialized successfully");
 
-                // Use completions_api() for OpenAI Chat Completions API (not Responses API)
-                // Note: rig 0.25.0 defaults to Responses API, so we must switch to completions_api first
-                let completions_client = client.completions_api();
-                let completion_model = completions_client.completion_model(model);
-
-                // Create agent builder with system prompt and temperature
-                let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = temperature {
-                    agent_builder = agent_builder.temperature(*temp);
-                }
-                // Build combined additional_params: reasoning_effort
-                // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
+                // Combined `additional_params`: reasoning_effort is merged in here because
+                // `AgentBuilder::additional_params()` replaces rather than merges.
                 let mut combined_params: Option<serde_json::Value> = None;
                 if let Some(effort) = *reasoning_effort {
                     combined_params =
@@ -413,27 +404,70 @@ impl Agent {
                         None => params.clone(),
                     });
                 }
-                if let Some(params) = combined_params {
-                    agent_builder = agent_builder.additional_params(params);
-                }
 
-                if let Some(max) = config.llm.max_tokens() {
-                    agent_builder = agent_builder.max_tokens(max);
-                }
+                match api {
+                    OpenAIApi::Responses => {
+                        // Responses API (`/v1/responses`) is the default Rig client surface.
+                        let completion_model = client.completion_model(model);
+                        let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
+                        agent_builder = agent_builder.preamble(config.effective_preamble());
+                        if let Some(temp) = temperature {
+                            agent_builder = agent_builder.temperature(*temp);
+                        }
+                        if let Some(params) = combined_params {
+                            agent_builder = agent_builder.additional_params(params);
+                        }
+                        if let Some(max) = config.llm.max_tokens() {
+                            agent_builder = agent_builder.max_tokens(max);
+                        }
 
-                // Add tools using the BuilderState helper
-                let builder_state = BuilderState::Initial(agent_builder);
-                let builder_state = if let Some(ref tools) = client_tools {
-                    Self::add_passthrough_tools(builder_state, tools)
-                } else {
-                    builder_state
-                };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        let builder_state = BuilderState::Initial(agent_builder);
+                        let builder_state = if let Some(ref tools) = client_tools {
+                            Self::add_passthrough_tools(builder_state, tools)
+                        } else {
+                            builder_state
+                        };
+                        let builder_state = Self::add_all_tools(
+                            builder_state,
+                            config,
+                            &mcp_manager,
+                            additional_tools,
+                        )
                         .await?;
-                let agent = builder_state.build();
+                        ProviderAgent::OpenAIResponses(builder_state.build())
+                    }
+                    OpenAIApi::ChatCompletions => {
+                        // Switch to Chat Completions API (`/v1/chat/completions`) — required
+                        // for OpenAI-compatible services that do not implement Responses.
+                        let completion_model = client.completions_api().completion_model(model);
+                        let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
+                        agent_builder = agent_builder.preamble(config.effective_preamble());
+                        if let Some(temp) = temperature {
+                            agent_builder = agent_builder.temperature(*temp);
+                        }
+                        if let Some(params) = combined_params {
+                            agent_builder = agent_builder.additional_params(params);
+                        }
+                        if let Some(max) = config.llm.max_tokens() {
+                            agent_builder = agent_builder.max_tokens(max);
+                        }
 
-                ProviderAgent::OpenAI(agent)
+                        let builder_state = BuilderState::Initial(agent_builder);
+                        let builder_state = if let Some(ref tools) = client_tools {
+                            Self::add_passthrough_tools(builder_state, tools)
+                        } else {
+                            builder_state
+                        };
+                        let builder_state = Self::add_all_tools(
+                            builder_state,
+                            config,
+                            &mcp_manager,
+                            additional_tools,
+                        )
+                        .await?;
+                        ProviderAgent::OpenAI(builder_state.build())
+                    }
+                }
             }
             LlmConfig::Anthropic {
                 api_key,

@@ -82,6 +82,7 @@ budget_tokens = 8000
                 context_window,
                 temperature,
                 additional_params,
+                api: _,
             } => {
                 assert_eq!(api_key, "test_openai_key");
                 assert_eq!(model, "gpt-4o-mini");
@@ -630,6 +631,98 @@ model = "llama3.2"
             }
             _ => panic!("Expected Ollama config"),
         }
+    }
+
+    #[test]
+    fn test_openai_api_defaults_to_responses() {
+        // No `api` field — default must be Responses (issue #91).
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-test"
+
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        match &config.agent.llm {
+            aura::config::LlmConfig::OpenAI { api, .. } => {
+                assert_eq!(*api, aura::config::OpenAIApi::Responses);
+            }
+            _ => panic!("Expected OpenAI config"),
+        }
+    }
+
+    #[test]
+    fn test_openai_api_responses_explicit() {
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-test"
+api = "responses"
+
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        match &config.agent.llm {
+            aura::config::LlmConfig::OpenAI { api, .. } => {
+                assert_eq!(*api, aura::config::OpenAIApi::Responses);
+            }
+            _ => panic!("Expected OpenAI config"),
+        }
+    }
+
+    #[test]
+    fn test_openai_api_chat_completions_explicit() {
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-test"
+api = "chat_completions"
+
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        match &config.agent.llm {
+            aura::config::LlmConfig::OpenAI { api, .. } => {
+                assert_eq!(*api, aura::config::OpenAIApi::ChatCompletions);
+            }
+            _ => panic!("Expected OpenAI config"),
+        }
+    }
+
+    #[test]
+    fn test_openai_api_invalid_value_rejected() {
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-test"
+api = "bogus"
+
+"#;
+        assert!(
+            load_config_from_str(config_str).is_err(),
+            "Invalid api value should be rejected"
+        );
     }
 
     #[test]

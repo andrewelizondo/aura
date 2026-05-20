@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
-use crate::config::{AgentConfig, LlmConfig};
+use crate::config::{AgentConfig, LlmConfig, OpenAIApi};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -2067,6 +2067,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                api,
                 ..
             } => {
                 let mut cb =
@@ -2074,18 +2075,33 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let client = cb
                     .build()
-                    .map_err(|e| format!("Failed to build OpenAI coordinator: {}", e))?
-                    .completions_api()
-                    .completion_model(model);
-                Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                    .map_err(|e| format!("Failed to build OpenAI coordinator: {}", e))?;
+                match api {
+                    OpenAIApi::Responses => {
+                        let cm = client.completion_model(model);
+                        Ok(ProviderAgent::OpenAIResponses(
+                            Self::build_agent_with_tools(
+                                cm,
+                                preamble,
+                                temperature,
+                                additional_params,
+                                tools,
+                            ),
+                        ))
+                    }
+                    OpenAIApi::ChatCompletions => {
+                        let cm = client.completions_api().completion_model(model);
+                        Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
+                            cm,
+                            preamble,
+                            temperature,
+                            additional_params,
+                            tools,
+                        )))
+                    }
+                }
             }
             LlmConfig::Anthropic {
                 api_key,
@@ -2206,6 +2222,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 base_url,
                 reasoning_effort,
                 additional_params,
+                api,
                 ..
             } => {
                 let mut cb =
@@ -2213,16 +2230,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let client = cb
                     .build()
-                    .map_err(|e| format!("Failed to build OpenAI worker: {}", e))?
-                    .completions_api()
-                    .completion_model(model);
-                let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.preamble(preamble);
-                if let Some(temp) = temperature {
-                    builder = builder.temperature(temp);
-                }
+                    .map_err(|e| format!("Failed to build OpenAI worker: {}", e))?;
+
                 // Build combined additional_params: reasoning_effort
                 let mut combined_params: Option<serde_json::Value> = None;
                 if let Some(effort) = reasoning_effort {
@@ -2235,15 +2246,45 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         None => params.clone(),
                     });
                 }
-                if let Some(params) = combined_params {
-                    builder = builder.additional_params(params);
+
+                match api {
+                    OpenAIApi::Responses => {
+                        let cm = client.completion_model(model);
+                        let mut builder = rig::agent::AgentBuilder::new(cm);
+                        builder = builder.preamble(preamble);
+                        if let Some(temp) = temperature {
+                            builder = builder.temperature(temp);
+                        }
+                        if let Some(params) = combined_params {
+                            builder = builder.additional_params(params);
+                        }
+                        if let Some(max) = worker_config.llm.max_tokens() {
+                            builder = builder.max_tokens(max);
+                        }
+                        let state = BuilderState::Initial(builder);
+                        let state =
+                            Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                        Ok((ProviderAgent::OpenAIResponses(state.build()), model.clone()))
+                    }
+                    OpenAIApi::ChatCompletions => {
+                        let cm = client.completions_api().completion_model(model);
+                        let mut builder = rig::agent::AgentBuilder::new(cm);
+                        builder = builder.preamble(preamble);
+                        if let Some(temp) = temperature {
+                            builder = builder.temperature(temp);
+                        }
+                        if let Some(params) = combined_params {
+                            builder = builder.additional_params(params);
+                        }
+                        if let Some(max) = worker_config.llm.max_tokens() {
+                            builder = builder.max_tokens(max);
+                        }
+                        let state = BuilderState::Initial(builder);
+                        let state =
+                            Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                        Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
+                    }
                 }
-                if let Some(max) = worker_config.llm.max_tokens() {
-                    builder = builder.max_tokens(max);
-                }
-                let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
-                Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
                 api_key,

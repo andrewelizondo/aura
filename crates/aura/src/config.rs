@@ -35,6 +35,36 @@ impl fmt::Display for ReasoningEffort {
     }
 }
 
+/// Selects which OpenAI HTTP surface the agent talks to.
+///
+/// - `Responses` targets `/v1/responses` — OpenAI's newer recommended API with
+///   richer semantic streaming events and first-class reasoning support.
+/// - `ChatCompletions` targets `/v1/chat/completions` — the original surface,
+///   commonly the only one implemented by third-party OpenAI-compatible services
+///   reached via a custom `base_url` (vLLM, LocalAI, OpenRouter, internal proxies).
+///
+/// The default is `Responses`, matching the upstream Rig client default and
+/// OpenAI's own recommendation for new integrations. Users on a custom
+/// `base_url` that does not implement the Responses API should opt in with
+/// `api = "chat_completions"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAIApi {
+    #[default]
+    Responses,
+    ChatCompletions,
+}
+
+impl fmt::Display for OpenAIApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            OpenAIApi::Responses => "responses",
+            OpenAIApi::ChatCompletions => "chat_completions",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Complete configuration for building an agent
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +241,12 @@ pub enum LlmConfig {
         /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
         #[serde(default)]
         additional_params: Option<serde_json::Value>,
+        /// Selects the OpenAI HTTP surface. Defaults to `Responses`
+        /// (`/v1/responses`). Set to `chat_completions` to fall back to the
+        /// legacy `/v1/chat/completions` endpoint — required for
+        /// OpenAI-compatible services that do not implement the Responses API.
+        #[serde(default)]
+        api: OpenAIApi,
     },
     Anthropic {
         api_key: String,
@@ -317,6 +353,7 @@ impl Default for LlmConfig {
             context_window: None,
             temperature: None,
             additional_params: None,
+            api: OpenAIApi::default(),
         }
     }
 }
@@ -574,6 +611,7 @@ impl Default for AgentConfig {
                 temperature: None,
                 reasoning_effort: None,
                 additional_params: None,
+                api: OpenAIApi::default(),
             },
             agent: AgentSettings {
                 name: "Assistant".to_string(),

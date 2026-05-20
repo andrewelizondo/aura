@@ -147,6 +147,9 @@ model = "gpt-5.2"
 # in aura.session_info streaming events. Set this to your model's
 # actual context window.
 # context_window = 200000
+# api = "responses"  # "responses" (default, /v1/responses) or "chat_completions"
+#                    # (/v1/chat/completions, required for some OpenAI-compatible
+#                    # services reached via a custom base_url).
 
 # Anthropic alternative:
 # provider = "anthropic"
