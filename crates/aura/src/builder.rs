@@ -61,6 +61,39 @@ pub(crate) fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_js
     }
 }
 
+/// Build the merged `additional_params` JSON for an OpenAI agent.
+///
+/// `reasoning_effort` must be encoded differently depending on the target
+/// HTTP surface: Chat Completions accepts a top-level `reasoning_effort`
+/// string, while the Responses API expects a structured `reasoning.effort`
+/// object (Rig's `AdditionalParameters` has no flat `reasoning_effort` field
+/// and silently drops unknown keys during `serde_json::from_value`).
+pub(crate) fn openai_combined_params(
+    reasoning_effort: Option<crate::config::ReasoningEffort>,
+    additional_params: Option<&serde_json::Value>,
+    api: crate::config::OpenAIApi,
+) -> Option<serde_json::Value> {
+    let mut combined: Option<serde_json::Value> = None;
+    if let Some(effort) = reasoning_effort {
+        let effort_json = match api {
+            crate::config::OpenAIApi::Responses => {
+                serde_json::json!({ "reasoning": { "effort": effort.to_string() } })
+            }
+            crate::config::OpenAIApi::ChatCompletions => {
+                serde_json::json!({ "reasoning_effort": effort.to_string() })
+            }
+        };
+        combined = Some(effort_json);
+    }
+    if let Some(params) = additional_params {
+        combined = Some(match combined {
+            Some(existing) => merge_json(existing, params.clone()),
+            None => params.clone(),
+        });
+    }
+    combined
+}
+
 /// Log tool count with optional filter indication
 fn log_filtered_tools(emoji: &str, transport: &str, server: &str, filtered: usize, total: usize) {
     if filtered < total {
@@ -376,9 +409,9 @@ impl Agent {
                 api,
                 ..
             } => {
-                tracing::info!("Initializing OpenAI provider");
+                let resolved_api = api.unwrap_or_default();
+                tracing::info!("Initializing OpenAI provider (api: {})", resolved_api);
                 tracing::debug!("  Model: {}", model);
-                tracing::info!("  API: {}", api);
 
                 let mut client_builder =
                     rig::providers::openai::Client::<reqwest::Client>::builder().api_key(api_key);
@@ -391,21 +424,15 @@ impl Agent {
                 let client = client_builder.build()?;
                 tracing::info!("OpenAI client initialized successfully");
 
-                // Combined `additional_params`: reasoning_effort is merged in here because
-                // `AgentBuilder::additional_params()` replaces rather than merges.
-                let mut combined_params: Option<serde_json::Value> = None;
-                if let Some(effort) = *reasoning_effort {
-                    combined_params =
-                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
-                }
-                if let Some(params) = additional_params {
-                    combined_params = Some(match combined_params {
-                        Some(existing) => merge_json(existing, params.clone()),
-                        None => params.clone(),
-                    });
-                }
+                // `reasoning_effort` is encoded differently for each surface — see
+                // `openai_combined_params` for why.
+                let combined_params = openai_combined_params(
+                    *reasoning_effort,
+                    additional_params.as_ref(),
+                    resolved_api,
+                );
 
-                match api {
+                match resolved_api {
                     OpenAIApi::Responses => {
                         // Responses API (`/v1/responses`) is the default Rig client surface.
                         let completion_model = client.completion_model(model);
@@ -682,6 +709,13 @@ impl Agent {
             .as_ref()
             .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
             .unwrap_or_default();
+
+        tracing::debug!(
+            "Agent constructed (provider: {}, api_surface: {}, model: {})",
+            provider_agent.provider_name(),
+            provider_agent.api_surface(),
+            model_name,
+        );
 
         Ok(Agent {
             inner: provider_agent,
@@ -1639,11 +1673,68 @@ impl AgentBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{OpenAIApi, ReasoningEffort};
     use crate::scratchpad::TiktokenCounter;
 
     fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
+    }
+
+    #[test]
+    fn openai_combined_params_responses_uses_structured_reasoning() {
+        // Critical: the Responses API path must emit `{reasoning: {effort: ...}}`,
+        // not the flat `{reasoning_effort: ...}`. Rig's `AdditionalParameters`
+        // has no flat field for it and silently drops unknown keys.
+        let params =
+            openai_combined_params(Some(ReasoningEffort::High), None, OpenAIApi::Responses)
+                .expect("must produce some params");
+        assert_eq!(
+            params,
+            serde_json::json!({ "reasoning": { "effort": "high" } }),
+            "Responses path must produce nested reasoning object"
+        );
+    }
+
+    #[test]
+    fn openai_combined_params_chat_completions_uses_flat_reasoning_effort() {
+        let params = openai_combined_params(
+            Some(ReasoningEffort::Medium),
+            None,
+            OpenAIApi::ChatCompletions,
+        )
+        .expect("must produce some params");
+        assert_eq!(
+            params,
+            serde_json::json!({ "reasoning_effort": "medium" }),
+            "Chat Completions path keeps the flat shape"
+        );
+    }
+
+    #[test]
+    fn openai_combined_params_merges_user_additional_params() {
+        let user = serde_json::json!({ "top_p": 0.9 });
+        let params = openai_combined_params(
+            Some(ReasoningEffort::High),
+            Some(&user),
+            OpenAIApi::Responses,
+        )
+        .expect("must produce some params");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "reasoning": { "effort": "high" },
+                "top_p": 0.9,
+            })
+        );
+    }
+
+    #[test]
+    fn openai_combined_params_none_when_nothing_to_merge() {
+        assert_eq!(
+            openai_combined_params(None, None, OpenAIApi::Responses),
+            None
+        );
     }
 
     #[test]

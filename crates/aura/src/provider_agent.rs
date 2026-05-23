@@ -74,6 +74,22 @@ impl ProviderAgent {
         }
     }
 
+    /// Identifies the provider's HTTP surface for logs and telemetry.
+    ///
+    /// Returns `"chat_completions"` or `"responses"` for the two OpenAI
+    /// variants (since `provider_name()` collapses them both to `"openai"`),
+    /// and the provider name for everything else.
+    pub fn api_surface(&self) -> &'static str {
+        match self {
+            Self::OpenAI(_) => "chat_completions",
+            Self::OpenAIResponses(_) => "responses",
+            Self::Anthropic(_) => "anthropic",
+            Self::Bedrock(_) => "bedrock",
+            Self::Gemini(_) => "gemini",
+            Self::Ollama(_) => "ollama",
+        }
+    }
+
     /// Stream a prompt with multi-turn support.
     ///
     /// Returns a boxed stream that yields `MultiTurnStreamItem` wrapped in our error type.

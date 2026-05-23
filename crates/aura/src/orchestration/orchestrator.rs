@@ -143,6 +143,33 @@ struct CoordinatorTools {
 // Helper Functions
 // ============================================================================
 
+/// Combine a parent `[agent.llm]` config with a per-worker override.
+///
+/// The override is a full replacement of the parent config, with one
+/// exception: when both sides are `LlmConfig::OpenAI` and the worker omits
+/// `api`, the parent's `api` value is copied across. Without this, a user
+/// who sets `[agent.llm].api = "chat_completions"` to talk to a Responses-less
+/// OpenAI-compatible proxy would silently see workers flip to Responses any
+/// time they only wanted to change the model (since the override is
+/// otherwise a full replacement).
+pub(crate) fn resolve_worker_llm(parent: &LlmConfig, override_llm: &LlmConfig) -> LlmConfig {
+    let mut resolved = override_llm.clone();
+    if let (
+        LlmConfig::OpenAI {
+            api: worker_api, ..
+        },
+        LlmConfig::OpenAI {
+            api: parent_api, ..
+        },
+    ) = (&mut resolved, parent)
+        && worker_api.is_none()
+        && parent_api.is_some()
+    {
+        *worker_api = *parent_api;
+    }
+    resolved
+}
+
 /// Spawns a task that monitors for external cancellation or timeout,
 /// cancelling the provided token when either occurs.
 ///
@@ -492,12 +519,12 @@ impl Orchestrator {
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
 
-        // Resolve per-worker LLM override (falls back to [agent.llm] when absent)
+        // Resolve per-worker LLM override (falls back to [agent.llm] when absent).
         if let Some(override_llm) = worker_name
             .and_then(|name| self.config.workers.get(name))
             .and_then(|w| w.llm.as_ref())
         {
-            worker_config.llm = override_llm.clone();
+            worker_config.llm = resolve_worker_llm(&self.agent_config.llm, override_llm);
         }
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
@@ -2067,9 +2094,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
                 api,
                 ..
             } => {
+                let resolved_api = api.unwrap_or_default();
+                tracing::info!(
+                    "Building OpenAI coordinator (api: {}, model: {})",
+                    resolved_api,
+                    model
+                );
                 let mut cb =
                     rig::providers::openai::Client::<reqwest::Client>::builder().api_key(api_key);
                 if let Some(url) = base_url {
@@ -2078,7 +2112,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let client = cb
                     .build()
                     .map_err(|e| format!("Failed to build OpenAI coordinator: {}", e))?;
-                match api {
+                // Re-merge `reasoning_effort` here so the coordinator honors it for OpenAI
+                // (the caller's `additional_params` argument is the raw field, not the merged
+                // form that the per-provider builder constructs). Uses the surface-aware
+                // shape so the Responses path gets `{reasoning: {effort: ...}}`.
+                let merged_params = crate::builder::openai_combined_params(
+                    *reasoning_effort,
+                    additional_params.as_ref(),
+                    resolved_api,
+                );
+                match resolved_api {
                     OpenAIApi::Responses => {
                         let cm = client.completion_model(model);
                         Ok(ProviderAgent::OpenAIResponses(
@@ -2086,7 +2129,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 cm,
                                 preamble,
                                 temperature,
-                                additional_params,
+                                merged_params,
                                 tools,
                             ),
                         ))
@@ -2097,7 +2140,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             cm,
                             preamble,
                             temperature,
-                            additional_params,
+                            merged_params,
                             tools,
                         )))
                     }
@@ -2225,6 +2268,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api,
                 ..
             } => {
+                let resolved_api = api.unwrap_or_default();
+                tracing::info!(
+                    "Building OpenAI worker (api: {}, model: {})",
+                    resolved_api,
+                    model
+                );
                 let mut cb =
                     rig::providers::openai::Client::<reqwest::Client>::builder().api_key(api_key);
                 if let Some(url) = base_url {
@@ -2234,20 +2283,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .build()
                     .map_err(|e| format!("Failed to build OpenAI worker: {}", e))?;
 
-                // Build combined additional_params: reasoning_effort
-                let mut combined_params: Option<serde_json::Value> = None;
-                if let Some(effort) = reasoning_effort {
-                    combined_params =
-                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
-                }
-                if let Some(params) = additional_params {
-                    combined_params = Some(match combined_params {
-                        Some(existing) => crate::builder::merge_json(existing, params.clone()),
-                        None => params.clone(),
-                    });
-                }
+                // `reasoning_effort` is encoded differently for each surface — see
+                // `openai_combined_params` for why.
+                let combined_params = crate::builder::openai_combined_params(
+                    *reasoning_effort,
+                    additional_params.as_ref(),
+                    resolved_api,
+                );
 
-                match api {
+                match resolved_api {
                     OpenAIApi::Responses => {
                         let cm = client.completion_model(model);
                         let mut builder = rig::agent::AgentBuilder::new(cm);
@@ -4135,6 +4179,87 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OpenAIApi;
+
+    fn openai_llm(model: &str, api: Option<OpenAIApi>) -> LlmConfig {
+        LlmConfig::OpenAI {
+            api_key: "sk-test".to_string(),
+            model: model.to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            reasoning_effort: None,
+            temperature: None,
+            additional_params: None,
+            api,
+        }
+    }
+
+    #[test]
+    fn worker_inherits_api_when_override_omits_it() {
+        let parent = openai_llm("gpt-5", Some(OpenAIApi::ChatCompletions));
+        let override_llm = openai_llm("gpt-4o-mini", None);
+        let resolved = resolve_worker_llm(&parent, &override_llm);
+        match resolved {
+            LlmConfig::OpenAI { model, api, .. } => {
+                assert_eq!(model, "gpt-4o-mini", "worker model wins");
+                assert_eq!(
+                    api,
+                    Some(OpenAIApi::ChatCompletions),
+                    "worker should inherit parent's api when its own is None"
+                );
+            }
+            other => panic!("expected OpenAI, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_explicit_api_overrides_parent() {
+        let parent = openai_llm("gpt-5", Some(OpenAIApi::ChatCompletions));
+        let override_llm = openai_llm("gpt-4o-mini", Some(OpenAIApi::Responses));
+        let resolved = resolve_worker_llm(&parent, &override_llm);
+        if let LlmConfig::OpenAI { api, .. } = resolved {
+            assert_eq!(
+                api,
+                Some(OpenAIApi::Responses),
+                "explicit worker api must not be overwritten by parent"
+            );
+        } else {
+            panic!("expected OpenAI variant");
+        }
+    }
+
+    #[test]
+    fn worker_inheritance_skipped_when_parent_is_other_provider() {
+        // Mixed provider: parent is OpenAI, worker overrides to Anthropic.
+        // Worker must NOT inherit OpenAI-specific `api` into the Anthropic variant.
+        let parent = openai_llm("gpt-5", Some(OpenAIApi::ChatCompletions));
+        let override_llm = LlmConfig::Anthropic {
+            api_key: "ant".to_string(),
+            model: "claude-3-haiku".to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            additional_params: None,
+        };
+        let resolved = resolve_worker_llm(&parent, &override_llm);
+        assert!(matches!(resolved, LlmConfig::Anthropic { .. }));
+    }
+
+    #[test]
+    fn worker_inheritance_no_op_when_parent_api_is_none() {
+        // Parent didn't specify api either — worker stays None (will resolve to
+        // the runtime default at agent construction).
+        let parent = openai_llm("gpt-5", None);
+        let override_llm = openai_llm("gpt-4o-mini", None);
+        let resolved = resolve_worker_llm(&parent, &override_llm);
+        if let LlmConfig::OpenAI { api, .. } = resolved {
+            assert_eq!(api, None);
+        } else {
+            panic!("expected OpenAI variant");
+        }
+    }
 
     #[test]
     fn test_truncate_query_short() {

@@ -65,6 +65,15 @@ impl fmt::Display for OpenAIApi {
     }
 }
 
+impl OpenAIApi {
+    /// True when this value equals the serde default. Used to keep
+    /// round-tripped TOML files free of redundant `api = "responses"`
+    /// entries that the user never typed.
+    pub fn is_default(&self) -> bool {
+        matches!(self, OpenAIApi::Responses)
+    }
+}
+
 /// Complete configuration for building an agent
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,12 +250,15 @@ pub enum LlmConfig {
         /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
         #[serde(default)]
         additional_params: Option<serde_json::Value>,
-        /// Selects the OpenAI HTTP surface. Defaults to `Responses`
-        /// (`/v1/responses`). Set to `chat_completions` to fall back to the
-        /// legacy `/v1/chat/completions` endpoint — required for
-        /// OpenAI-compatible services that do not implement the Responses API.
-        #[serde(default)]
-        api: OpenAIApi,
+        /// Selects the OpenAI HTTP surface. When `None`, resolves to
+        /// `Responses` at construction time — except in orchestration mode,
+        /// where a worker that omits `api` inherits its value from
+        /// `[agent.llm]` so partial overrides (e.g. just changing the model)
+        /// don't silently flip the HTTP surface. Set to `chat_completions`
+        /// explicitly to use `/v1/chat/completions` — required for
+        /// OpenAI-compatible services that don't implement Responses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api: Option<OpenAIApi>,
     },
     Anthropic {
         api_key: String,
@@ -353,7 +365,7 @@ impl Default for LlmConfig {
             context_window: None,
             temperature: None,
             additional_params: None,
-            api: OpenAIApi::default(),
+            api: None,
         }
     }
 }
@@ -611,7 +623,7 @@ impl Default for AgentConfig {
                 temperature: None,
                 reasoning_effort: None,
                 additional_params: None,
-                api: OpenAIApi::default(),
+                api: None,
             },
             agent: AgentSettings {
                 name: "Assistant".to_string(),

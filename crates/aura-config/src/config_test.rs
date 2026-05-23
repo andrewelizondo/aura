@@ -634,8 +634,11 @@ model = "llama3.2"
     }
 
     #[test]
-    fn test_openai_api_defaults_to_responses() {
-        // No `api` field — default must be Responses (issue #91).
+    fn test_openai_api_omitted_remains_none() {
+        // No `api` field — must remain `None` at parse time so the orchestrator's
+        // worker inheritance step can distinguish "user did not specify" from
+        // "user explicitly chose Responses". The runtime default (Responses) is
+        // applied at agent construction, not at parse.
         let config_str = r#"
 [agent]
 name = "Test"
@@ -651,7 +654,7 @@ api_key = "sk-test"
 
         match &config.agent.llm {
             aura::config::LlmConfig::OpenAI { api, .. } => {
-                assert_eq!(*api, aura::config::OpenAIApi::Responses);
+                assert_eq!(*api, None);
             }
             _ => panic!("Expected OpenAI config"),
         }
@@ -675,7 +678,7 @@ api = "responses"
 
         match &config.agent.llm {
             aura::config::LlmConfig::OpenAI { api, .. } => {
-                assert_eq!(*api, aura::config::OpenAIApi::Responses);
+                assert_eq!(*api, Some(aura::config::OpenAIApi::Responses));
             }
             _ => panic!("Expected OpenAI config"),
         }
@@ -699,7 +702,7 @@ api = "chat_completions"
 
         match &config.agent.llm {
             aura::config::LlmConfig::OpenAI { api, .. } => {
-                assert_eq!(*api, aura::config::OpenAIApi::ChatCompletions);
+                assert_eq!(*api, Some(aura::config::OpenAIApi::ChatCompletions));
             }
             _ => panic!("Expected OpenAI config"),
         }
@@ -719,9 +722,36 @@ api_key = "sk-test"
 api = "bogus"
 
 "#;
+        // Tightened from a bare `.is_err()` so a future regression that fails
+        // for an unrelated reason can't accidentally pass this test.
+        let err = load_config_from_str(config_str).expect_err("Invalid api value must be rejected");
+        let msg = err.to_string().to_lowercase();
         assert!(
-            load_config_from_str(config_str).is_err(),
-            "Invalid api value should be rejected"
+            msg.contains("bogus") || msg.contains("api") || msg.contains("variant"),
+            "Error should mention the invalid value, the `api` field, or the variant — got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_openai_api_round_trip_omits_when_none() {
+        // Serializing back to TOML must not inject `api = "responses"` for configs
+        // that never set the field — otherwise round-tripping pollutes diffs and
+        // pins the file to the current default.
+        let cfg = aura::config::LlmConfig::OpenAI {
+            api_key: "sk-test".to_string(),
+            model: "gpt-4o".to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            reasoning_effort: None,
+            temperature: None,
+            additional_params: None,
+            api: None,
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(
+            !json.contains("\"api\""),
+            "api field should be omitted when None — got: {json}"
         );
     }
 
