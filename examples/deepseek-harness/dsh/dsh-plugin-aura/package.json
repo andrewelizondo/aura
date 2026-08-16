@@ -1,0 +1,21 @@
+{
+  "name": "dsh-plugin-aura",
+  "version": "0.1.0",
+  "description": "dsh bundle plugin: an aura_query tool that delegates a sub-question to an AURA agent over its OpenAI-compatible API",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  }
+}

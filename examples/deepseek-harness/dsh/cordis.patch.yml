@@ -1,0 +1,50 @@
+# Example dsh profile patch layer: AURA provider route + shared MCP server.
+#
+# This is the COMPOSITION-PLANE equivalent of ../settings.yaml — drop it into a
+# profile's cordis.patch.yml (or pass it with --patch) instead of editing
+# $DSH_HOME/settings.yaml. Later layers win per row, and a patch replaces the
+# targeted row's WHOLE config, so a row here restates every key it owns.
+#
+# Verify with:  dsh --profile <p> --dump-config
+
+# ── (a) AURA as a provider route ─────────────────────────────────────────────
+# Overrides the dsh-base `llm-pi-ai` row (mounted dormant, no config) by id.
+# Same route shape as settings.yaml; see the comments there for why apiKeyEnv
+# must reference a set, non-empty env var even though AURA ignores the token.
+- id: llm-pi-ai
+  config:
+    providers:
+      aura:
+        displayName: AURA
+        apiKeyEnv: AURA_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8080/v1
+        models:
+          # id must match the AURA agent's alias/name (GET /v1/models lists them).
+          - id: aura-default
+            name: AURA Default Agent
+            contextWindow: 128000
+            maxTokens: 8192
+
+# ── (b) shared tool plane: the same MCP server AURA uses ────────────────────
+# examples/deepseek-harness/aura-backend-for-dsh.toml attaches an MCP "docs"
+# server at http://localhost:8081/mcp to the AURA agent. Pointing a dsh
+# mcp-client instance at the SAME server gives both agents the same tools:
+# the dsh agent calls them directly as mcp__docs__<toolName>, and the AURA
+# agent uses them internally when dsh delegates a question to it.
+- insert:
+    - id: docs-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        # Namespace for the model-facing tool names (mcp__docs__*). Must match
+        # [A-Za-z0-9_-]{1,32} and be unique across mcp-client instances.
+        serverName: docs
+        transport: streamable-http
+        url: http://localhost:8081/mcp
+        headers:
+          # Same secret the AURA config forwards ({{ env.DOCS_MCP_TOKEN }}).
+          Authorization: !!js >-
+            'Bearer ' + (process.env.DOCS_MCP_TOKEN ?? '')
+        toolCallTimeoutMs: 60000
+        # Keep booting if the server is down; the client reconnects with backoff.
+        failOnStartupError: false

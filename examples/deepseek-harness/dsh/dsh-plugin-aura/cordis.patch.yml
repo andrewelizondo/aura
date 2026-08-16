@@ -1,0 +1,14 @@
+# Bundle patch layer: applied when a profile lists dsh-plugin-aura in its
+# dsh.profile.bundles (which `dsh plugin --profile <p> add ./dsh-plugin-aura`
+# arranges). The row references the package by name so Node resolution finds
+# the installed code. Users override this row's config in their profile's own
+# cordis.patch.yml by restating the row with the same id.
+- insert:
+    - id: aura-delegate
+      name: dsh-plugin-aura
+      config:
+        baseURL: http://127.0.0.1:8080/v1
+        model: aura-default
+        # Uncomment to send a bearer token (AURA accepts and ignores one today):
+        # apiKeyEnv: AURA_API_KEY
+        timeoutMs: 120000
