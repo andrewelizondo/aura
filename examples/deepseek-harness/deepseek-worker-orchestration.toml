@@ -1,0 +1,71 @@
+# Mixed-fleet orchestration: OpenAI coordinator with a DeepSeek worker.
+#
+# Demonstrates per-worker LLM overrides across providers. Workers inherit
+# [agent.llm] unless they define their own [orchestration.worker.<name>.llm].
+# An override is a COMPLETE LlmConfig — it replaces the coordinator's config
+# entirely, with no field merging — so a DeepSeek worker must restate its
+# provider, api_key, base_url, and model even though the coordinator already
+# defines an LLM. Here the "researcher" worker runs on DeepSeek (cheap,
+# high-volume reading) while the "analyst" worker inherits the coordinator's
+# gpt-4o by defining no LLM block of its own.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export DEEPSEEK_API_KEY="sk-..."
+#
+# Usage:
+#   CONFIG_PATH=examples/deepseek-harness/deepseek-worker-orchestration.toml cargo run --bin aura-web-server
+
+[agent]
+name = "Research Coordinator"
+system_prompt = """
+You are a research coordinator. You decompose research questions into
+sub-tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Gathering source material, summarizing documents, broad reading: delegate to researcher
+- Comparing findings, drawing conclusions, structuring the final answer: delegate to analyst
+- Simple factual questions: answer directly if possible
+"""
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+context_window = 128_000
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+
+allow_direct_answers = true
+allow_clarification = true
+
+# Researcher worker — overridden to DeepSeek. High-volume summarization is
+# where a cheaper model pays off; the coordinator still plans on gpt-4o.
+[orchestration.worker.researcher]
+description = "Source gathering and summarization: read material, extract key facts, and report findings"
+turn_depth = 8
+preamble = """
+You are a Research Specialist. Gather and summarize source material for the
+task you are given. Report facts with enough context that another agent can
+verify them — do not editorialize or draw final conclusions.
+"""
+
+[orchestration.worker.researcher.llm]
+provider = "openai"
+api_key = "{{ env.DEEPSEEK_API_KEY }}"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+context_window = 64_000
+
+# Analyst worker — no [.llm] block, so it inherits the coordinator's
+# [agent.llm] (gpt-4o) unchanged.
+[orchestration.worker.analyst]
+description = "Analysis and synthesis: compare findings, resolve conflicts, and structure conclusions"
+turn_depth = 6
+preamble = """
+You are an Analyst. Take the researcher's findings and synthesize them into
+a clear, structured answer. Flag any conflicting or unverified claims rather
+than papering over them.
+"""

@@ -1,0 +1,50 @@
+# AURA as an OpenAI-compatible backend for DeepSeek Harness (dsh).
+#
+# dsh registers custom model providers that speak the OpenAI chat-completions
+# protocol. Point a dsh provider route at this server and dsh sees a single
+# "model" — but behind that model id, AURA composes an LLM, a system prompt,
+# and MCP tool servers. Tool calls happen inside AURA; dsh only ever sees the
+# final assistant messages, so AURA-managed tools stay invisible to dsh.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export DOCS_MCP_TOKEN="..."   # auth for the example MCP server below
+#
+# Usage:
+#   CONFIG_PATH=examples/deepseek-harness/aura-backend-for-dsh.toml cargo run --bin aura-web-server
+#
+# Then point dsh's llm-pi-ai provider route at http://127.0.0.1:8080/v1 and
+# request model id "aura-default" (see examples/deepseek-harness/dsh/ for the
+# dsh-side provider registration).
+
+[agent]
+name = "aura-default"
+# The alias (or name, if alias is omitted) is the model id dsh requests in
+# its provider route, and it is what GET /v1/models lists. Keep it stable —
+# dsh's model registry references it by this string.
+alias = "aura-default"
+system_prompt = """
+You are a general-purpose assistant served through an OpenAI-compatible API.
+You have access to external tools via MCP. Use them to ground your answers
+in real data instead of guessing; cite which tool result supports each claim.
+"""
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+# dsh's provider route declares a contextWindow when registering the model.
+# Keep the two in sync: this value drives AURA's usage-percentage reporting,
+# and dsh uses its declared value for prompt budgeting.
+context_window = 128_000
+
+# Example MCP server: internal docs search over HTTP streamable transport.
+# These tools are attached to the agent inside AURA — dsh never sees them,
+# it just receives better-grounded answers.
+[mcp.servers.docs]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Internal documentation search"
+
+[mcp.servers.docs.headers]
+Authorization = "Bearer {{ env.DOCS_MCP_TOKEN }}"

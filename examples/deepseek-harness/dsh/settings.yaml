@@ -1,0 +1,48 @@
+# Example $DSH_HOME/settings.yaml fragment: AURA as a custom LLM provider.
+#
+# This is the USER-PLANE way to register AURA in DeepSeek Harness (dsh): the
+# `llm-pi-ai:` section is read by the @deepseek-ai/dsh-llm-pi-ai adapter (mounted
+# dormant by the dsh-base bundle) and is hot-reloaded — the route registers on
+# the next request, no restart. The composition-plane equivalent (a cordis
+# patch layer) is in ./cordis.patch.yml; use one or the other, not both, for
+# the same route key.
+#
+# Prerequisite on the AURA side:
+#   CONFIG_PATH=examples/deepseek-harness/aura-backend-for-dsh.toml \
+#     cargo run --bin aura-web-server
+#
+# Merge this fragment into your existing $DSH_HOME/settings.yaml (the
+# `providers` dict merges per provider key, so it coexists with other routes).
+
+llm-pi-ai:
+  providers:
+    # Provider route id. Permanent once used: requests, saved sessions, and
+    # credential references all key off it — rename by adding a new route.
+    aura:
+      displayName: AURA
+
+      # AURA enforces no inbound auth today — it accepts and ignores a bearer
+      # token. The env var still has to exist AND be non-empty: pi-ai's
+      # openai-completions implementation requires a credential, and a
+      # configured apiKeyEnv that resolves to nothing fails the request with
+      # MISSING_CREDENTIAL. So:  export AURA_API_KEY=unused
+      apiKeyEnv: AURA_API_KEY
+
+      # AURA's /v1/chat/completions is OpenAI-compatible; pi-ai appends
+      # /chat/completions to this baseURL.
+      api: openai-completions
+      baseURL: http://127.0.0.1:8080/v1
+
+      # Each model id must match an AURA agent's alias (or name) exactly —
+      # that string is what AURA resolves to a configured agent. AURA lists
+      # them at GET /v1/models, which is also what dsh's "Fetch available
+      # models" button in the Web UI (Settings → Models) queries, so you can
+      # discover them instead of typing them.
+      models:
+        - id: aura-default
+          name: AURA Default Agent
+          # Keep contextWindow in sync with the AURA agent's
+          # [agent.llm].context_window — dsh budgets prompts against this
+          # declared value; AURA reports usage against its own.
+          contextWindow: 128000
+          maxTokens: 8192

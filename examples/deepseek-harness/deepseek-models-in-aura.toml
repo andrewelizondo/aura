@@ -1,0 +1,19 @@
+# DeepSeek hosted models in AURA.
+# DeepSeek's API is OpenAI-compatible, so it works through the "openai"
+# provider with a custom base_url — no dedicated provider needed.
+#
+# Usage:
+#   export DEEPSEEK_API_KEY="sk-..."
+#   CONFIG_PATH=examples/deepseek-harness/deepseek-models-in-aura.toml cargo run --bin aura-web-server
+
+[agent]
+name = "DeepSeek Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.DEEPSEEK_API_KEY }}"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+# For chain-of-thought reasoning, use DeepSeek's reasoning model instead:
+# model = "deepseek-reasoner"
