@@ -15,7 +15,7 @@ expect its config shapes to move.
 | [`aura-backend-for-dsh.toml`](aura-backend-for-dsh.toml) | dsh → AURA | AURA agent served as an OpenAI-compatible "model" that dsh consumes; MCP tools stay AURA-side |
 | [`deepseek-models-in-aura.toml`](deepseek-models-in-aura.toml) | AURA → DeepSeek | DeepSeek's hosted API as an AURA LLM via `provider = "openai"` + `base_url` |
 | [`deepseek-worker-orchestration.toml`](deepseek-worker-orchestration.toml) | AURA → DeepSeek | Mixed fleet: gpt-4o coordinator, DeepSeek worker via per-worker LLM override |
-| [`dsh/`](dsh/) | dsh side | Provider route (`settings.yaml`), shared-MCP patch layer, and a delegation-tool bundle plugin |
+| [`dsh/`](dsh/) | dsh side | Provider route (`settings.yaml`), shared-MCP patch layer, and an operator-console bundle plugin (`aura_units` / `aura_status` / `aura_invoke` — AURA as "systemd for agents", dsh as the console) |
 
 ## Quick start (agent-as-model, the recommended pairing)
 

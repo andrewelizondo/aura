@@ -34,7 +34,7 @@ completions and MCP — which yields six candidate surfaces:
 |---|-----------|---------|--------|
 | A1 | dsh → AURA | AURA as a dsh model provider (`llm-pi-ai` route) | config only |
 | A2 | both | Shared MCP servers (one tool plane, two harnesses) | config only |
-| A3 | dsh → AURA | dsh tool plugin delegating to an AURA agent | small JS plugin |
+| A3 | dsh → AURA | dsh operator-console plugin (`auractl`-style toolset) | small JS plugin |
 | B1 | AURA → DeepSeek | DeepSeek hosted models as an AURA provider | config only |
 | B2 | AURA → dsh | dsh tools exposed to AURA over MCP | new dsh plugin (missing piece) |
 | B3 | both | Agent-protocol bridge (AURA A2A ⇄ dsh ACP) | future work |
@@ -81,17 +81,44 @@ both harnesses one tool plane with zero new code. Naming differs by
 convention only: dsh prefixes tools as `mcp__<serverName>__<tool>`, AURA
 keeps raw names filtered through `mcp_filter` globs.
 
-### A3. dsh delegation tool (`dsh-plugin-aura`)
+### A3. dsh as an operator console for AURA (`dsh-plugin-aura`)
 
-Where A1 replaces dsh's model wholesale, a delegation tool keeps dsh on
-its own model and hands specific sub-questions to an AURA agent as a
-single tool call (`aura_query` → `POST /v1/chat/completions`,
-`stream: false`). This is a complete third-party dsh bundle — a
-`package.json` with `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`,
-a patch inserting the plugin row, and an ESM `index.js` exporting
-`name`/`inject`/`Config`/`apply` that registers the tool via
-`ctx.tools.register(defineTool({...}))`. It doubles as the reference
-skeleton for any future AURA-flavored dsh plugin (B2).
+The organizing idea: **AURA is systemd for agents**. An AURA deployment
+is a long-running supervisor whose agents are declarative TOML unit
+files — an `[agent]` table names the unit, `[agent.llm]` binds its
+runtime, `[mcp.servers.*]` attaches resources, `[orchestration.worker.*]`
+declares the dependency graph the unit brings up. The supervisor owns
+lifecycle (graceful two-phase shutdown, request cancellation), health,
+and a uniform control surface. Interactive harnesses are then transient
+sessions that talk *to* the supervisor, the way a shell talks to systemd
+through `systemctl` — they should not have to re-declare any of the
+agent plumbing.
+
+`dsh-plugin-aura` makes dsh exactly that console. It is a complete
+third-party dsh bundle (`package.json` with
+`"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`, a patch layer
+inserting the plugin row, an ESM `index.js` registering tools via
+`ctx.tools.register(defineTool({...}))`) exposing a `systemctl`-shaped
+toolset:
+
+| Tool | Analog | AURA endpoint |
+|------|--------|---------------|
+| `aura_units` | `systemctl list-units` | `GET /aura/info` + `GET /v1/models` |
+| `aura_status` | `systemctl status` | `GET /health` |
+| `aura_invoke` | `systemctl start` / `busctl call` | `POST /v1/chat/completions` |
+
+`GET /aura/info` was built for exactly this projection: it lists each
+unit's model, its workers (annotated only when a worker overrides the
+coordinator model), and its MCP attachments, credential-stripped at the
+source (`crates/aura/src/orchestration/overview.rs` reduces URLs to
+origins and commands to basenames) — so a console never sees secrets it
+would have to be trusted with. `aura_invoke` subsumes plain delegation:
+the dsh model discovers units, then dispatches sub-tasks to whichever
+unit's capabilities fit, while the unit runs its own MCP tools/RAG
+server-side and returns a grounded final answer.
+
+The plugin doubles as the reference skeleton for any future
+AURA-flavored dsh plugin (B2).
 
 ### B1. DeepSeek hosted models inside AURA
 
@@ -143,9 +170,9 @@ Adopt in three tiers:
    are pure configuration against released behavior on both sides. See
    `examples/deepseek-harness/` — AURA TOMLs at the top level, dsh-side
    YAML and the bundle plugin under `dsh/`.
-2. **Next (small code, dsh side):** A3 hardening if delegation proves
-   useful beyond the example, then B2 (the MCP-server plugin), published
-   as an npm bundle with the `dsh-plugin` GitHub topic.
+2. **Next (small code, dsh side):** A3 — the operator-console plugin —
+   hardening beyond the example, then B2 (the MCP-server plugin), both
+   published as npm bundles with the `dsh-plugin` GitHub topic.
 3. **Later, on demand:** B3, plus an upstream contribution registering an
    AURA catalog route in pi-ai once dsh exits developer preview.
 
