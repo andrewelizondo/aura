@@ -7,8 +7,9 @@
     - id: aura-delegate
       name: dsh-plugin-aura
       config:
-        baseURL: http://127.0.0.1:8080/v1
-        model: aura-default
+        # Server root; the plugin derives /v1, /health, and /aura/info from it.
+        serverURL: http://127.0.0.1:8080
+        defaultUnit: aura-default
         # Uncomment to send a bearer token (AURA accepts and ignores one today):
         # apiKeyEnv: AURA_API_KEY
         timeoutMs: 120000

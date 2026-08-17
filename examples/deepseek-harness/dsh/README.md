@@ -14,14 +14,14 @@ A profile patch layer with (a) the same provider route declared in the compositi
 
 **Use when** the provider route should ship with a profile/bundle rather than live in user settings, or when dsh and AURA should share one MCP tool source.
 
-## 3. AURA as a delegation tool — [`dsh-plugin-aura/`](dsh-plugin-aura/)
+## 3. dsh as an AURA operator console — [`dsh-plugin-aura/`](dsh-plugin-aura/)
 
-A complete, minimal third-party bundle plugin (plain ESM, no build step) registering one tool, `aura_query`, that POSTs a sub-question to AURA's `/v1/chat/completions` and returns the answer. dsh keeps its own model and tools; AURA becomes one tool among them.
+A complete, minimal third-party bundle plugin (plain ESM, no build step) that treats AURA as "systemd for agents" and gives dsh an `auractl`-style toolset over it: `aura_units` lists the loaded agent units and their capabilities (workers, MCP servers), `aura_status` checks the supervisor daemon's health, and `aura_invoke` dispatches work to a unit and returns its grounded final answer. dsh keeps its own model and tools; AURA's units become dispatchable services.
 
-**Use when** the dsh agent should stay primary and only *delegate* questions needing AURA's data sources (MCP/RAG/orchestration) — the multi-agent pattern, one tool call per delegation.
+**Use when** the dsh agent should stay primary, operating the AURA supervisor interactively — discover units, check the daemon, and *delegate* questions needing a unit's data sources (MCP/RAG/orchestration).
 
 |  | dsh's model | AURA's role | dsh sees AURA's tools? |
 | --- | --- | --- | --- |
 | provider route (1, 2a) | the AURA agent | is the model | no — results only |
 | shared MCP (2b) | any | sibling agent | yes — same server, called directly |
-| `aura_query` plugin (3) | any | one tool | no — final answers only |
+| operator-console plugin (3) | any | supervised units | no — unit metadata + final answers only |
